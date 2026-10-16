@@ -1,0 +1,62 @@
+name: Release
+
+# Push a tag like v0.2.0 to build the binaries, publish a GitHub release and mirror it to Hugging Face.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.repository == 'Dalailalama/embeddinggemma2-rust'
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            archive: egemma2-${{ github.ref_name }}-windows-x64.zip
+          - os: ubuntu-latest
+            archive: egemma2-${{ github.ref_name }}-linux-x64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/egemma2.exe, README.md, LICENSE, NOTICE dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir dist
+          cp target/release/egemma2 README.md LICENSE NOTICE dist/
+          tar -czf "${{ matrix.archive }}" -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --title "egemma2 ${{ github.ref_name }}" --generate-notes
+      - name: Mirror to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then echo "::warning::HF_TOKEN secret not set: skipping the Hugging Face upload"; exit 0; fi
+          python -m pip install --quiet --upgrade huggingface_hub
+          hf upload DawgOG/embeddinggemma2-rust dist "releases/${{ github.ref_name }}" --commit-message "egemma2 ${{ github.ref_name }}"

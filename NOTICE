@@ -1,0 +1,12 @@
+egemma2: EmbeddingGemma 2 in Rust
+Copyright 2026 DawgOG (https://huggingface.co/DawgOG, https://github.com/Dalailalama)
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is an unofficial, independent implementation of Google's EmbeddingGemma 2 model
+(https://huggingface.co/google/embeddinggemma-2) and is not affiliated with, sponsored by or
+endorsed by Google. The model weights are not part of this repository; Google distributes them
+under the Apache License, Version 2.0. "Gemma" and "EmbeddingGemma" are trademarks of Google LLC.
+
+The reference behaviour it reproduces is that of the Hugging Face transformers and
+sentence-transformers implementations (Apache License, Version 2.0).

@@ -1,0 +1,8 @@
+/target
+/models
+/.venv
+/.claude
+# Over GitHub's 100 MB file limit; regenerate with tools/ref_video.py
+/testdata/video/v40_96x160.patches.bin
+# Benchmark outputs are machine-specific
+/testdata/bench_*.json

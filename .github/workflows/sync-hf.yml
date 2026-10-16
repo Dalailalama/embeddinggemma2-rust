@@ -1,0 +1,22 @@
+name: Sync Hugging Face card
+
+# Keeps https://huggingface.co/DawgOG/embeddinggemma2-rust in step with hf/README.md.
+on:
+  push:
+    branches: [main]
+    paths: ["hf/**", ".github/workflows/sync-hf.yml"]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    if: github.repository == 'Dalailalama/embeddinggemma2-rust'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload the model card
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then echo "::warning::HF_TOKEN secret not set: skipping"; exit 0; fi
+          python -m pip install --quiet --upgrade huggingface_hub
+          hf upload DawgOG/embeddinggemma2-rust hf/README.md README.md --commit-message "Sync model card from GitHub ${GITHUB_SHA::7}"
