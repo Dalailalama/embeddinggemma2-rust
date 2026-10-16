@@ -1,11 +1,17 @@
 name: Sync Hugging Face card
 
-# Keeps https://huggingface.co/DawgOG/embeddinggemma2-rust in step with hf/README.md.
+# Keeps https://huggingface.co/DawgOG/embeddinggemma2-rust in step with hf/README.md. Run it by hand with a
+# release tag to (re-)mirror that GitHub release's binaries into releases/<tag> on Hugging Face.
 on:
   push:
     branches: [main]
     paths: ["hf/**", ".github/workflows/sync-hf.yml"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Also mirror this GitHub release's binaries (e.g. v0.1.0)"
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -13,10 +19,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Upload the model card
+      - name: Upload the model card (and a release's binaries)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
         run: |
           if [ -z "$HF_TOKEN" ]; then echo "::warning::HF_TOKEN secret not set: skipping"; exit 0; fi
           python -m pip install --quiet --upgrade huggingface_hub
           hf upload DawgOG/embeddinggemma2-rust hf/README.md README.md --commit-message "Sync model card from GitHub ${GITHUB_SHA::7}"
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "release-$TAG"
+            hf upload DawgOG/embeddinggemma2-rust "release-$TAG" "releases/$TAG" --commit-message "egemma2 $TAG"
+          fi

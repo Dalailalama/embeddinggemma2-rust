@@ -52,7 +52,13 @@ jobs:
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --title "egemma2 ${{ github.ref_name }}" --generate-notes
+        # Re-runs replace the assets of an existing release instead of failing.
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --title "egemma2 ${{ github.ref_name }}" --generate-notes
+          fi
       - name: Mirror to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
