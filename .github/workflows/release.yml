@@ -20,7 +20,7 @@ jobs:
             archive: egemma2-${{ github.ref_name }}-linux-x64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - name: Package (Windows)
@@ -36,7 +36,7 @@ jobs:
           mkdir dist
           cp target/release/egemma2 README.md LICENSE NOTICE dist/
           tar -czf "${{ matrix.archive }}" -C dist .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
@@ -45,7 +45,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
