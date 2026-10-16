@@ -9,6 +9,10 @@
 //! kernel on the Windows/WDDM test machine, ~370 launches per pass), so those passes are recorded once
 //! into a CUDA graph per padded row count and replayed: the graph's buffers keep their addresses and only
 //! their contents (embeddings, sequence metadata) change between calls (`EGEMMA2_NO_GRAPH` turns this off).
+//!
+//! Attention over packed short sequences (a "fused" pass) is one launch per layer. In bf16 mode both the 256-wide
+//! sliding-window and the 512-wide global layers run it on the tensor-core flash kernels with a per-pass tile list
+//! (see `PackedFlash`); float32 and TF32 use the float32 packed kernel.
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -65,15 +69,69 @@ pub struct GpuText {
     embed_proj: GpuLinear,
     /// Grow-only RoPE tables; row `i` depends only on position `i`, so a longer table serves shorter inputs.
     rope: Mutex<HashMap<(u64, usize), RopeTable>>,
-    /// Recorded short passes by padded row count (see [`GRAPH_ROW_BUCKETS`]); empty when graphs are off.
-    graphs: Mutex<HashMap<usize, TextGraph>>,
+    /// Recorded short passes by padded row count (see [`GRAPH_ROW_BUCKETS`]) and whether they use the packed flash
+    /// kernels (see [`PackedFlash`]); empty when graphs are off.
+    graphs: Mutex<HashMap<(usize, bool), TextGraph>>,
     use_graphs: AtomicBool,
+    packed_flash: PackedFlash,
 }
 
 /// Row counts the graphs are recorded for: an input is padded up to the next bucket with a dummy
 /// sequence at the end (rows are independent apart from attention, which stays within a sequence), so
 /// a handful of graphs serves every short input. Longer inputs are GPU-bound and run without a graph.
 const GRAPH_ROW_BUCKETS: [usize; 9] = [8, 16, 24, 32, 48, 64, 80, 96, 128];
+
+/// Which fused bf16 passes run their attention on the tensor-core packed flash kernels instead of the
+/// float32 packed kernel (`EGEMMA2_PACKED_FLASH`; float32 and TF32 modes always use the packed kernel).
+///
+/// A flash tile costs about the same whether its sequence has 5 tokens or 64 (a 64-row Q tile, a K/V tile, a few
+/// barriers), while the packed kernel's cost grows with the keys each row walks. So the choice follows the average
+/// sequence length of the pass ([`FLASH_MIN_MEAN_LEN`]), for eager passes and recorded graphs alike (graphs are cached
+/// per row bucket and kernel). `EGEMMA2_PACKED_FLASH=0` turns the flash path off everywhere, `2` forces it on (`1`, or
+/// unset, is the default length rule).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackedFlash {
+    Off,
+    Auto,
+    All,
+}
+
+/// Average sequence length (tokens) from which a packed pass takes the flash path. Measured end to end on the
+/// development GPU (bf16, passes replayed from CUDA graphs, packed kernel -> flash): 1 x 8 tokens 2.29 -> 2.35 ms,
+/// 16 x 7: 3.44 -> 3.59, 8 x 15: 3.43 -> 3.48, 1 x 16 and 4 x 16: even; 1 x 32: 2.71 -> 2.55, 2 x 30: 2.94 -> 2.87,
+/// 1 x 64: 3.32 -> 3.06, 2 x 60: 4.04 -> 3.63, 1 x 126: 4.87 -> 3.88; the batch of 64 documents (45 tokens on
+/// average, eager) gains the most.
+const FLASH_MIN_MEAN_LEN: usize = 24;
+
+impl PackedFlash {
+    fn from_env() -> Self {
+        match std::env::var("EGEMMA2_PACKED_FLASH").as_deref() {
+            Ok("0") => Self::Off,
+            Ok("2") => Self::All,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Whether a packed pass over sequences of `lens` tokens takes the flash path.
+    fn enabled(self, lens: &[usize]) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Auto => lens.iter().sum::<usize>() >= FLASH_MIN_MEAN_LEN * lens.len(),
+            Self::All => true,
+        }
+    }
+}
+
+/// Attention inputs and tile list of a fused pass whose layers use the packed flash kernels (`Work::flash`).
+struct FlashWork {
+    /// bf16 q/k/v of those layers (`Work::q` / `k` / `v`, float32, serve the layers that stay on the packed kernel).
+    q: Act,
+    k: Act,
+    v: Act,
+    /// Tile list ({row0, len, q0} triples, see `Gpu::flash_packed_tiles`), uploaded per call; `n_tiles` is the grid.
+    tiles: CudaSlice<i32>,
+    n_tiles: usize,
+}
 
 /// Per-pass device buffers (sized for `rows`), reused by all layers. The residual stream (`hidden`) and the
 /// per-layer inputs are float32; the [`Act`] buffers, the inputs and outputs of the matrix products, are bf16
@@ -93,6 +151,7 @@ struct Work {
     q: Act,
     k: Act,
     v: Act,
+    flash: Option<FlashWork>,
     a: Act,
     o: Act,
     gu: Act,
@@ -154,6 +213,7 @@ impl GpuText {
             rope: Mutex::new(HashMap::new()),
             graphs: Mutex::new(HashMap::new()),
             use_graphs: AtomicBool::new(std::env::var_os("EGEMMA2_NO_GRAPH").is_none() && !gpu.profiling()),
+            packed_flash: PackedFlash::from_env(),
             gpu,
         })
     }
@@ -181,14 +241,26 @@ impl GpuText {
         Ok(replaced)
     }
 
+    /// Whether some layer's packed attention can run on the tensor-core flash kernel (bf16 mode).
+    fn has_flash_layers(&self) -> bool {
+        let nh = self.cfg.num_attention_heads;
+        self.layers.iter().any(|l| self.gpu.packed_flash_supported(nh, l.n_kv, l.head_dim))
+    }
+
     /// Device buffers for a pass over `rows` rows. `graph` buffers also keep the pristine input and the
-    /// full (fused-attention) sequence metadata; `fused` passes use the packed attention kernel.
-    fn new_work(&self, rows: usize, graph: bool, fused: bool) -> Result<Work> {
+    /// full (fused-attention) sequence metadata; `fused` passes use the packed attention kernels, the flash
+    /// ones when `flash_tiles` (the grid of the tile list) is given.
+    fn new_work(&self, rows: usize, graph: bool, fused: bool, flash_tiles: Option<usize>) -> Result<Work> {
         let g = &*self.gpu;
         let cfg = &self.cfg;
         let (h, p, nl, nh) = (cfg.hidden_size, cfg.hidden_size_per_layer_input, cfg.num_hidden_layers, cfg.num_attention_heads);
-        let q_w = self.layers.iter().map(|l| nh * l.head_dim).max().unwrap_or(0);
-        let kv_w = self.layers.iter().map(|l| l.n_kv * l.head_dim).max().unwrap_or(0);
+        // The flash layers' q/k/v live in `flash`; `q` / `k` / `v` only need to fit the other layers.
+        let on_flash = |l: &Layer| flash_tiles.is_some() && g.packed_flash_supported(nh, l.n_kv, l.head_dim);
+        let q_w = self.layers.iter().filter(|l| !on_flash(l)).map(|l| nh * l.head_dim).max().unwrap_or(0);
+        let kv_w = self.layers.iter().filter(|l| !on_flash(l)).map(|l| l.n_kv * l.head_dim).max().unwrap_or(0);
+        let fq_w = self.layers.iter().filter(|l| on_flash(l)).map(|l| nh * l.head_dim).max().unwrap_or(0);
+        let fkv_w = self.layers.iter().filter(|l| on_flash(l)).map(|l| l.n_kv * l.head_dim).max().unwrap_or(0);
+        let a_w = self.layers.iter().map(|l| nh * l.head_dim).max().unwrap_or(0);
         let qkv_w = self.layers.iter().map(|l| l.qkv_proj.out).max().unwrap_or(0);
         let ff_w = self.layers.iter().map(|l| l.gate_up.out / 2).max().unwrap_or(0);
         let bf = g.bf16_act();
@@ -206,7 +278,18 @@ impl GpuText {
             q: attn_in(rows * q_w)?,
             k: attn_in(rows * kv_w)?,
             v: attn_in(rows * kv_w)?,
-            a: g.alloc_act(rows * q_w)?,
+            flash: match flash_tiles {
+                Some(n_tiles) => Some(FlashWork {
+                    q: g.alloc_act(rows * fq_w)?,
+                    k: g.alloc_act(rows * fkv_w)?,
+                    v: g.alloc_act(rows * fkv_w)?,
+                    // All zeros: len-0 tiles, which the kernel skips.
+                    tiles: g.upload_i32(&vec![0; 3 * n_tiles])?,
+                    n_tiles,
+                }),
+                None => None,
+            },
+            a: g.alloc_act(rows * a_w)?,
             o: g.alloc_act(rows * h)?,
             gu: g.alloc_act(rows * 2 * ff_w)?,
             gate: g.alloc_act(rows * ff_w)?,
@@ -266,18 +349,31 @@ impl GpuText {
 
             l.qkv_proj.forward_act(g, &w.t, rows, &mut w.qkv)?;
             g.mark("GEMM qkv");
-            g.qkv_post_act(&w.qkv, &mut w.q, &mut w.k, &mut w.v, [&l.q_norm, &l.k_norm, &tab.cos, &tab.sin], Some(&pos), rows, nh, l.n_kv, hd, hd, eps)?;
+            // Layers on the packed flash kernel get bf16 q/k/v and the pass's tile list, the others float32 ones.
+            let mut flash = w.flash.as_mut().filter(|_| fused && g.packed_flash_supported(nh, l.n_kv, hd));
+            let (qb, kb, vb) = match flash.as_mut() {
+                Some(f) => (&mut f.q, &mut f.k, &mut f.v),
+                None => (&mut w.q, &mut w.k, &mut w.v),
+            };
+            g.qkv_post_act(&w.qkv, qb, kb, vb, [&l.q_norm, &l.k_norm, &tab.cos, &tab.sin], Some(&pos), rows, nh, l.n_kv, hd, hd, eps)?;
             g.mark("qkv_post (norms + RoPE)");
-            if fused {
+            if let Some(f) = flash {
+                g.attention_flash_packed(&f.q, &f.k, &f.v, &mut w.a, &f.tiles.slice(..), f.n_tiles, nh, l.n_kv, hd, l.window)?;
+                g.mark(if hd == 256 { "attn: packed flash (d256)" } else { "attn: packed flash (d512)" });
+            } else if fused {
                 g.attention_packed_act(&w.q, &w.k, &w.v, &mut w.a, &start, &len, rows, nh, l.n_kv, hd, l.window)?;
-                g.mark("attn: packed");
+                g.mark(if hd == 256 { "attn: packed (d256)" } else { "attn: packed (d512)" });
             } else {
                 let mut row0 = 0;
                 for &n in lens {
                     g.attention_act(&w.q, &w.k, &w.v, &mut w.a, row0, n, nh, l.n_kv, hd, l.window)?;
                     row0 += n;
                 }
-                g.mark(if hd == 256 { "attn: flash (d256)" } else { "attn: cuBLAS rest" });
+                g.mark(match hd {
+                    256 if g.flash_on() => "attn: flash (d256)",
+                    512 if g.bf16_act() && g.flash_on() => "attn: flash (d512)",
+                    _ => "attn: cuBLAS rest",
+                });
             }
             l.o_proj.forward_act(g, &w.a, rows, &mut w.o)?;
             g.mark("GEMM o");
@@ -347,11 +443,20 @@ impl GpuText {
                 padded.push(bucket - rows);
             }
             let meta = Self::row_meta(&padded, true);
-            if let Entry::Vacant(slot) = graphs.entry(bucket) {
+            // The flash launch has a fixed grid in the recording: one tile per row is the most any split of `bucket`
+            // rows into sequences needs (a sequence of n rows takes ceil(n / 64) <= n tiles), padded with empty ones.
+            // The choice follows the real sequences, not the padding.
+            let flash = self.packed_flash.enabled(lens) && self.has_flash_layers();
+            let tiles = if flash { Gpu::flash_packed_tiles(0, &padded, bucket) } else { Vec::new() };
+            debug_assert!(!flash || tiles.len() == 3 * bucket);
+            if let Entry::Vacant(slot) = graphs.entry((bucket, flash)) {
                 // Recording is cheap (a few ms); if it is refused for any reason, run without graphs from now on.
                 let built = (|| -> Result<TextGraph> {
-                    let mut work = self.new_work(bucket, true, true)?;
+                    let mut work = self.new_work(bucket, true, true, flash.then_some(bucket))?;
                     g.upload_i32_into(&meta, &mut work.meta)?;
+                    if let Some(f) = &mut work.flash {
+                        g.upload_i32_into(&tiles, &mut f.tiles)?;
+                    }
                     let graph = g.capture(|| self.enqueue(&mut work, &padded, true, &rope))?;
                     Ok(TextGraph { work, graph })
                 })();
@@ -362,19 +467,27 @@ impl GpuText {
                     Err(_) => self.use_graphs.store(false, Ordering::Relaxed),
                 }
             }
-            if let Some(tg) = graphs.get_mut(&bucket) {
+            if let Some(tg) = graphs.get_mut(&(bucket, flash)) {
                 let mut x = vec![0f32; bucket * h];
                 x[..inputs_embeds.len()].copy_from_slice(inputs_embeds);
                 g.upload_into(&x, tg.work.x_in.as_mut().unwrap())?;
                 g.upload_i32_into(&meta, &mut tg.work.meta)?;
+                if let Some(f) = &mut tg.work.flash {
+                    g.upload_i32_into(&tiles, &mut f.tiles)?;
+                }
                 g.replay(&tg.graph)?;
                 return g.download_prefix(tg.work.out.f32()?, rows * cfg.embedding_dim);
             }
         }
 
-        let mut w = self.new_work(rows, false, fused)?;
+        let flash = fused && self.packed_flash.enabled(lens) && self.has_flash_layers();
+        let tiles = if flash { Gpu::flash_packed_tiles(0, lens, 0) } else { Vec::new() };
+        let mut w = self.new_work(rows, false, fused, flash.then_some(tiles.len() / 3))?;
         g.upload_into(inputs_embeds, &mut w.hidden)?;
         g.upload_i32_into(&Self::row_meta(lens, fused), &mut w.meta)?;
+        if let Some(f) = &mut w.flash {
+            g.upload_i32_into(&tiles, &mut f.tiles)?;
+        }
         self.enqueue(&mut w, lens, fused, &rope)?;
         g.download(w.out.f32()?)
     }

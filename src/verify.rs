@@ -95,8 +95,8 @@ impl Tolerances {
     /// stream stay float32).
     ///
     /// Bounds come from measurement on an RTX A3000 (CUDA 13.2, the 90 checks of the reference set), first with
-    /// cuBLAS text attention and then with the tensor-core flash kernels (second figures):
-    ///   embeddings (incl. Matryoshka cuts)  worst max|d| 1.50e-3 / 1.29e-3, worst cos 0.99996550 / 0.99996712
+    /// cuBLAS text attention and then with the tensor-core flash kernels for every head width (second figures):
+    ///   embeddings (incl. Matryoshka cuts)  worst max|d| 1.50e-3 / 1.43e-3, worst cos 0.99996550 / 0.99996251
     ///   soft tokens (incl. tower-only)      worst max|d| 1.33 / 1.33,       worst cos 0.99980725 / 0.99980725
     /// Same headroom rules as TF32: max-abs ~2.7x above the worst value seen, cosine floors with >= 2x
     /// headroom on 1-cos (3.5e-5 -> 9e-5 for embeddings, 1.9e-4 -> 4e-4 for soft tokens). For scale,

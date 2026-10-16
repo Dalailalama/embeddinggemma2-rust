@@ -46,17 +46,17 @@ egemma2 similarity --query "red planet" --doc "Mars is the fourth planet" --doc 
 
 Checked number for number against the PyTorch reference (transformers + sentence-transformers) on 90
 checks covering text, images, audio, video and prompts: float32 embeddings differ by at most 1e-6.
-bf16 mode stays within cosine 0.99996 of float32, about 8x closer than PyTorch's own bf16 mode.
+bf16 mode stays within cosine 0.99996 of float32, about 7x closer than PyTorch's own bf16 mode.
 
 ## Speed (RTX A3000 laptop GPU, warm medians)
 
 | Workload | PyTorch bf16 | **Rust bf16** | |
 |---|---|---|---|
-| short query (17 tokens) | 49.4 ms | **2.5 ms** | 19x |
-| long document (2,208 tokens) | 136 ms | **50.0 ms** | 2.7x |
-| batch of 64 short documents | 117 ms | **53.6 ms** | 2.2x |
-| image 641x479 | 151 ms | **59.2 ms** | 2.55x |
-| audio 9.3 s | 96.7 ms | **19.1 ms** | 5.1x |
+| short query (17 tokens) | 52.9 ms | **2.6 ms** | 20x |
+| long document (2,208 tokens) | 136 ms | **47.1 ms** | 2.9x |
+| batch of 64 short documents | 119 ms | **45.1 ms** | 2.6x |
+| image 641x479 | 151 - 169 ms | **59.1 ms** | 2.5 - 2.9x |
+| audio 9.3 s | 100 ms | **19.5 ms** | 5.1x |
 
 On the CPU (i7-12850HX) Rust is 1.2 - 1.9x faster than PyTorch, starts in 0.9 s instead of 11 s and
 uses about 4x less memory. fp32/TF32 numbers and methodology are in the

@@ -38,5 +38,12 @@ fn main() -> anyhow::Result<()> {
     println!("embed_texts, first 32 docs {:7.2} ms", median(|| drop(model.embed_texts(&half).unwrap()), 10));
     let one = vec![batch[0].clone()];
     println!("embed_texts, 1 doc         {:7.2} ms", median(|| drop(model.embed_texts(&one).unwrap()), 10));
+    // Small packs that fit a recorded CUDA graph (<= 128 rows).
+    let queries: Vec<String> = ["red planet", "how do vaccines work", "rust borrow checker", "best pizza in naples", "black holes", "tax deadline", "learn guitar chords", "cheap flights"].map(String::from).to_vec();
+    let rows: usize = queries.iter().map(|t| model.tokenize(t).unwrap().len()).sum();
+    println!("embed_texts, 8 queries     {:7.2} ms  ({rows} rows)", median(|| drop(model.embed_texts(&queries).unwrap()), 50));
+    let small: Vec<String> = batch.iter().filter(|t| model.tokenize(t).unwrap().len() < 40).take(3).cloned().collect();
+    let rows: usize = small.iter().map(|t| model.tokenize(t).unwrap().len()).sum();
+    println!("embed_texts, {} short docs  {:7.2} ms  ({rows} rows)", small.len(), median(|| drop(model.embed_texts(&small).unwrap()), 50));
     Ok(())
 }

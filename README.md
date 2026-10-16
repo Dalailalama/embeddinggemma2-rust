@@ -52,7 +52,7 @@ These are float32 rounding differences; cosine similarity with the reference pri
 | CPU, float32 | float32 (embeddings <= 5e-6) | 9.9e-7 | 90 / 90 |
 | CUDA, float32 (default) | float32 (embeddings <= 5e-6) | 8.4e-7 | 90 / 90 |
 | CUDA, `--tf32` | tf32 (embeddings <= 1e-3 **and** cosine >= 0.99999) | 4.3e-4, min cosine 0.9999946 | 90 / 90 |
-| CUDA, `--bf16` | bf16 (embeddings <= 4e-3 **and** cosine >= 0.99991) | 1.3e-3, min cosine 0.9999671 | 90 / 90 |
+| CUDA, `--bf16` | bf16 (embeddings <= 4e-3 **and** cosine >= 0.99991) | 1.4e-3, min cosine 0.9999625 | 90 / 90 |
 
 TF32 rounds GEMM inputs to a 10-bit mantissa, so `--tf32` gets its own, measured tolerance profile.
 The max-abs bound has about 2.3x headroom over the worst case seen. The cosine floor stops a real bug
@@ -60,7 +60,7 @@ from hiding inside it: a uniform 9e-4 error passes the max-abs bound but fails t
 computed on the CPU (patches, log-mel) keep the strict limits in every profile. `verify` prints the
 active profile first and the worst case per quantity last. The bf16 profile was derived the same way
 (max-abs ~2.7x and 1 - cos at least 2x above the worst case seen). For scale, PyTorch's own bf16 mode
-lands at cosine 0.99975 on the 9.3 s audio clip, about 8x further from the reference (in 1 - cos) than
+lands at cosine 0.99975 on the 9.3 s audio clip, about 7x further from the reference (in 1 - cos) than
 this port's bf16 worst case.
 
 ## Speed: Rust vs. the Python original
@@ -73,33 +73,34 @@ PyTorch 2.14.1 + transformers 5.19 + sentence-transformers 6.1 with its default 
 
 | Workload | PyTorch fp32 | **Rust fp32** | PyTorch TF32 | **Rust TF32** | PyTorch bf16 | **Rust bf16** |
 |---|---|---|---|---|---|---|
-| short query (17 tokens) | 40.9 ms | **4.1 ms** (10x) | 51.3 ms | **3.6 ms** (14x) | 49.4 ms | **2.5 ms** (19x) |
-| long document (2,208 tokens) | 300 ms | **193 ms** (1.55x) | 245 ms | **107 ms** (2.3x) | 136 ms | **50.0 ms** (2.7x) |
-| batch of 64 short documents | 219 ms | **157 ms** (1.4x) | 143 ms | **81.2 ms** (1.76x) | 117 ms | **53.6 ms** (2.2x) |
-| image 641x479 | 310 ms | **222 ms** (1.4x) | 238 ms | **137 ms** (1.74x) | 151 ms | **59.2 ms** (2.55x) |
-| audio 9.3 s | 88.7 ms | **52.6 ms** (1.69x) | 87.4 ms | **25.9 ms** (3.4x) | 96.7 ms | **19.1 ms** (5.1x) |
-| GPU memory (rise over idle) | 3.8 GB | **2.5 GB** | 3.7 GB | **2.5 GB** | 2.2 GB | **1.3 GB** |
-| worst cosine vs. fp32 reference | 1.0000000 | 1.0000000 | 0.999997 | 0.9999946 | 0.99975 | 0.9999671 |
+| short query (17 tokens) | 45.4 ms | **4.1 ms** (11x) | 45.6 ms | **3.6 ms** (12.7x) | 52.9 ms | **2.6 ms** (20x) |
+| long document (2,208 tokens) | 297 ms | **190 ms** (1.56x) | 243 ms | **105 ms** (2.3x) | 136 ms | **47.1 ms** (2.9x) |
+| batch of 64 short documents | 217 ms | **156 ms** (1.39x) | 142 ms | **80.4 ms** (1.77x) | 119 ms | **45.1 ms** (2.6x) |
+| image 641x479 | 307 ms | **219 ms** (1.4x) | 237 ms | **136 ms** (1.75x) | 169 ms | **59.1 ms** (2.9x) |
+| audio 9.3 s | 96.8 ms | **52.1 ms** (1.86x) | 85.7 ms | **25.7 ms** (3.3x) | 100 ms | **19.5 ms** (5.1x) |
+| GPU memory (rise over idle) | 3.7 GB | **2.5 GB** | 3.7 GB | **2.5 GB** | 2.2 GB | **1.3 GB** |
+| worst cosine vs. fp32 reference | 1.0000000 | 1.0000000 | 0.999997 | 0.9999946 | 0.99975 | 0.9999625 |
 
 Speed-ups are Rust vs. PyTorch at the same precision; all six columns come from one run of
 `tools/bench_gpu_compare.py`. bf16 is the model card's recommendation on GPUs. **Rust bf16 is the
-fastest configuration on every workload: 2.2 - 19x faster than PyTorch bf16, with 40% less GPU
-memory, and about 8x closer to the float32 reference** (1 - cos 3.3e-5 vs. 2.5e-4). Rust TF32 also
-beats PyTorch bf16 on all five workloads while staying ~50x closer to the reference. PyTorch bf16 is
-still faster than Rust *fp32* on the long document, the batch and the image. Worst cosines for Rust
-are over the 90 `verify` checks; for PyTorch, over the four benchmark inputs (the audio clip in both
-reduced-precision modes).
+fastest configuration on every workload: 2.6 - 20x faster than PyTorch bf16, with 40% less GPU
+memory, and about 7x closer to the float32 reference** (1 - cos 3.7e-5 vs. 2.5e-4). PyTorch's image
+time varies more than the rest between runs (151 - 169 ms over the last two), so read that ratio as
+2.5 - 2.9x. Rust TF32 also beats PyTorch bf16 on all five workloads while staying ~50x closer to the
+reference; PyTorch bf16 is still faster than Rust *fp32* on the long document, the batch and the
+image. Worst cosines for Rust are over the 90 `verify` checks; for PyTorch, over the four benchmark
+inputs (the audio clip in both reduced-precision modes).
 
-The short query is where the gap is biggest. PyTorch takes 41 - 51 ms on the GPU, about as long as on
+The short query is where the gap is biggest. PyTorch takes 45 - 53 ms on the GPU, about as long as on
 the CPU (48 ms), so its short-query time is fixed per-call overhead rather than compute. Rust replays
-the 17-token pass from a recorded CUDA graph in 2.5 - 4 ms. The large inputs are bound by
+the 17-token pass from a recorded CUDA graph in 2.6 - 4 ms. The large inputs are bound by
 matrix-multiply throughput and memory traffic on both sides, so the margin there is smaller:
-1.4 - 1.7x at fp32, 1.7 - 3.4x with TF32 and 2.2 - 5x with bf16. In bf16 mode two steps took the
+1.4 - 1.9x at fp32, 1.75 - 3.3x with TF32 and 2.6 - 5x with bf16. In bf16 mode three steps took the
 large inputs most of the way (see [GPU](#gpu-cuda)): storing the tensors around each matrix product
-as bf16 cut the times by about a fifth (long document 79.6 -> 62.8 ms, batch 69.1 -> 53.6 ms, image
-79.2 -> 62.2 ms), and tensor-core flash attention for the text's sliding-window layers and the vision
-tower brought the long document to 50.0 ms and the image to 59.2 ms. The batch of 64 still uses the
-packed short-sequence kernel (see [Limitations](#limitations)).
+as bf16 (long document 79.6 -> 62.8 ms, batch 69.1 -> 53.6 ms, image 79.2 -> 62.2 ms), tensor-core
+flash attention for the text's sliding-window layers and the vision tower (long document 50.0 ms,
+image 59.2 ms), and flash kernels for the text's 512-wide global layers and for packed batches of
+short texts (long document 47.1 ms, batch 45.1 ms).
 
 ### CPU vs. CPU
 
@@ -226,7 +227,7 @@ All three towers run on an NVIDIA GPU through the CUDA backend. The device is ch
 | `--device cpu` | CPU only |
 | `--device cuda`, `--device cuda:N` | CUDA device 0, or device number N; a clean error instead of a fallback if CUDA can't be used |
 | `--tf32` | let cuBLAS use TF32 tensor cores: faster, embeddings deviate from float32 by up to ~4e-4 (see [Parity](#parity-with-the-original-pytorch-float32)). Off by default; ignored on the CPU |
-| `--bf16` | run every linear layer and the attention products on bf16 tensor cores, with bf16 activations around them: fastest, embeddings deviate by up to ~1.3e-3 (cosine >= 0.99996). Needs compute capability 8.0+ (Ampere or newer). Off by default; ignored on the CPU |
+| `--bf16` | run every linear layer and the attention products on bf16 tensor cores, with bf16 activations around them: fastest, embeddings deviate by up to ~1.4e-3 (cosine >= 0.99996). Needs compute capability 8.0+ (Ampere or newer). Off by default; ignored on the CPU |
 
 **Requirements.** An NVIDIA GPU with its driver, and the CUDA 13.x runtime libraries
 `cublas64_13.dll` and `nvrtc64_130_0.dll` findable on `PATH` (the `bin` directory of a CUDA Toolkit
@@ -238,11 +239,11 @@ untested.
 
 - Activations stay on the GPU for a whole tower forward pass. Only the inputs (token embeddings,
   image patches, log-mel features) go up and the final per-token states come down.
-- Every matrix product is a cuBLAS GEMM, with q|k|v and gate|up merged into single GEMMs. Text
-  attention uses batched cuBLAS GEMMs around a windowed-softmax kernel, and sliding-window layers
-  only multiply the keys within reach of each query block. The vision tower uses a fused
-  flash-style kernel (head_dim 64). Packed batches of short texts use one fused attention launch per
-  layer.
+- Every matrix product is a cuBLAS GEMM, with q|k|v and gate|up merged into single GEMMs. In fp32 and
+  TF32 mode, text attention uses batched cuBLAS GEMMs around a windowed-softmax kernel (sliding-window
+  layers only multiply the keys within reach of each query block), the vision tower a fused
+  flash-style kernel (head_dim 64), and packed batches of short texts one fused attention launch per
+  layer. bf16 mode runs all attention on tensor-core flash kernels, see below.
 - Launch and allocation overhead is the bottleneck for short inputs. Layers therefore use few, fused
   kernels (norm + RoPE, residual add + norm, gated activations), scratch buffers are allocated once
   per pass, and short text passes (up to 128 rows) are recorded once as CUDA graphs and replayed.
@@ -261,17 +262,26 @@ untested.
   kernel that produces a product's input (a norm, the GELU gate, an attention output, ...) rounds it on
   the way out, which is exactly the rounding the product would apply, so that part changes no result;
   cuBLAS rounds the outputs. Together that halves the memory traffic of every element-wise step. The
-  residual stream, the norms' statistics, softmax and all sums stay float32. Attention over the
-  vision tower's 64-wide heads and the text's 256-wide sliding-window heads is a tensor-core flash
-  kernel (`kernels_sm80.cu`): `cp.async` copies into XOR-swizzled shared memory, `ldmatrix` fragment
-  loads and inline-PTX `mma.m16n8k16`, so the score matrix never leaves the chip and keys outside a
-  query tile's window are skipped. It runs at ~21-25 TFLOPS, against ~5 for the fp32 flash kernel,
-  and lands closer to an exact float64 reference than the cuBLAS path (`examples/check_attention.rs`).
-  The text's 512-wide global layers still use bf16 cuBLAS products around a softmax that writes bf16
-  probabilities directly. The per-head norm + RoPE step runs one warp per head. The audio tower
+  residual stream, the norms' statistics, softmax and all sums stay float32.
+- **Tensor-core flash attention (bf16 mode).** Every attention layer runs on flash kernels in
+  `kernels_sm80.cu`: `cp.async` copies into XOR-swizzled shared memory, `ldmatrix` fragment loads and
+  inline-PTX `mma.m16n8k16`, so the score matrix never leaves the chip and keys outside a query tile's
+  window are skipped. The vision tower's 64-wide heads and the text's 256-wide sliding-window heads
+  share one kernel (64 queries per block of 4 warps). The text's 512-wide global heads have their own:
+  a warp cannot hold a 16 x 512 float32 output tile, so its 8 warps pair up, each half of a pair
+  keeping Q in registers and accumulating the output for 256 of the 512 channels, with the partial
+  scores exchanged through shared memory. They run at ~21-25 TFLOPS, against ~5 for the fp32 flash
+  kernel, and land closer to an exact float64 reference than the cuBLAS path
+  (`examples/check_attention.rs`). Packed batches of short texts use the same kernels in a tile-list
+  mode (one launch covers all sequences, 64 queries per tile) when their sequences average 24 tokens
+  or more; below that the float32 packed kernel, which walks each row's few keys serially, is faster
+  (`examples/profile_packed.rs`). The per-head norm + RoPE step runs one warp per head. The audio tower
   keeps float32 activations; its front end (subsampling convs) is exact float32 in every mode and its
   relative-position table keeps float32 weights.
 - Debug switches: `EGEMMA2_NO_FLASH` (cuBLAS attention instead of the fused kernels),
+  `EGEMMA2_PACKED_FLASH` (packed text batches: by default the tensor-core flash kernels when the
+  sequences average 24+ tokens, else the float32 packed-attention kernel; `0`: always the packed
+  kernel, `2`: always flash),
   `EGEMMA2_NO_GRAPH` (no CUDA graphs) and `EGEMMA2_PROFILE` (device time per operation; see
   `examples/profile_passes.rs`).
 
@@ -350,9 +360,8 @@ file limit. The pixel check of that 40-frame clip is skipped unless you regenera
 
 - **GPU: CUDA only, one device.** There is no ROCm/Metal/Vulkan backend. A model uses a single GPU
   (pick it with `cuda:N`) and calls into it are serialised. bf16 needs compute capability 8.0+.
-  The text's 512-wide global layers (4 of 24) still go through cuBLAS with the score matrix in
-  memory, and packed batches of short texts use a float32 kernel that walks the keys one by one;
-  moving both onto the tensor-core flash kernel is the next speed-up.
+  The tensor-core flash kernels are bf16-only; fp32 and TF32 keep the cuBLAS attention path for long
+  texts and the float32 packed kernel for batches of short ones.
 - **Audio input is WAV** (8/16/24/32-bit PCM or 32-bit float), mixed down to mono. Other sample
   rates are resampled with a windowed-sinc filter. That works fine but is not bit-identical to
   librosa or torchaudio. Audio is truncated at 30 s like the reference feature extractor;

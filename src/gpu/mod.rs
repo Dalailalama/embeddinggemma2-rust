@@ -10,8 +10,9 @@
 //! recorded CUDA graph), and memory traffic (so the vision tower uses a fused flash-style attention kernel
 //! and, in bf16 mode, the tensors that go into and come out of matrix products are stored as bf16, see
 //! [`Act`]; residual streams, normalisation statistics, softmax and all accumulation stay float32).
-//! Debug switches: `EGEMMA2_NO_FLASH` (cuBLAS attention instead of the fused vision kernel),
-//! `EGEMMA2_NO_GRAPH` (no CUDA graphs for short text passes) and `EGEMMA2_PROFILE` (device time per op,
+//! Debug switches: `EGEMMA2_NO_FLASH` (cuBLAS / float32 attention instead of the fused flash kernels),
+//! `EGEMMA2_NO_GRAPH` (no CUDA graphs for short text passes), `EGEMMA2_PACKED_FLASH` (which packed text
+//! passes use the tensor-core flash kernel, see `text::PackedFlash`) and `EGEMMA2_PROFILE` (device time per op,
 //! see `examples/profile_passes.rs`).
 
 pub mod audio;
@@ -96,8 +97,13 @@ struct BfKernels {
     /// Tensor-core flash attention for head_dim 64: float32 I/O, and bf16 I/O.
     flash_d64: CudaFunction,
     flash_d64_bb: CudaFunction,
-    /// Tensor-core flash attention for head_dim 256 (the text backbone's sliding-window layers), bf16 I/O.
+    /// Tensor-core flash attention for head_dim 256 (the text backbone's sliding-window layers), bf16 I/O, and its
+    /// tile-list variant over many packed sequences (see [`Gpu::attention_flash_packed`]).
     flash_d256_bb: CudaFunction,
+    flash_d256_packed_bb: CudaFunction,
+    /// Tensor-core flash attention for head_dim 512 (the text backbone's global layers), bf16 I/O, with an optional
+    /// tile list for packed passes; needs [`FLASH_D512_SMEM`] bytes of dynamic shared memory.
+    flash_d512_bb: CudaFunction,
     /// Packed attention with a bf16 output, keyed like [`Kernels::attn_packed`] (which is empty in bf16 mode).
     attn_packed_fb: PackedKernels,
     /// Warp-per-head `qkv_post`, keyed by (head_dim / 32, bf16 input, bf16 output); head_dim 64 takes RoPE
@@ -193,6 +199,14 @@ unsafe impl Sync for Gpu {}
 /// reading each K/V row once per group (measured crossover on the development GPU).
 const PACKED_SPLIT_UP_TO: usize = 130;
 
+/// Query rows per tile of the packed flash kernels' tile lists (the kernels' 64 queries per block).
+pub const FLASH_TILE_ROWS: usize = 64;
+
+/// Keys per tile of `flash_attn_d512_bb` (kernels_sm80.cu; 16 or 32), and its dynamic shared memory: K and V tiles of
+/// that many keys x 512 bf16 plus the partial scores of 8 warps x 16 rows x that many keys.
+const FLASH_D512_BK: usize = 32;
+const FLASH_D512_SMEM: usize = 2 * FLASH_D512_BK * 512 * 2 + 8 * 16 * FLASH_D512_BK * 4;
+
 /// "No clamping" bounds.
 pub const NO_CLAMP: (f32, f32) = (f32::NEG_INFINITY, f32::INFINITY);
 
@@ -262,7 +276,7 @@ impl Gpu {
 
         let bf16 = precision == Precision::Bf16;
         let ptx = if bf16 {
-            let src = format!("#define EG_BF16\n{KERNELS}\n{KERNELS_SM80}");
+            let src = format!("#define EG_BF16\n#define FLASH_D512_BK {FLASH_D512_BK}\n{KERNELS}\n{KERNELS_SM80}");
             compile_ptx_with_opts(src, CompileOptions { use_fast_math: Some(false), arch: Some("compute_80"), ..Default::default() })
         } else {
             compile_ptx_with_opts(KERNELS, CompileOptions { use_fast_math: Some(false), ..Default::default() })
@@ -322,6 +336,11 @@ impl Gpu {
             }
         }
         let bf = if bf16 {
+            let flash_d512_bb = f("flash_attn_d512_bb")?;
+            // More than the 48 KB a launch gets by default: opt in (sm_86 allows up to 99 KB per block).
+            flash_d512_bb
+                .set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, FLASH_D512_SMEM as i32)
+                .map_err(|e| anyhow!("flash_attn_d512_bb needs {FLASH_D512_SMEM} bytes of shared memory per block: {e:?}"))?;
             Some(BfKernels {
                 rms_norm_fb: f("rms_norm_fb")?,
                 add_norm_fb: f("add_norm_fb")?,
@@ -337,6 +356,8 @@ impl Gpu {
                 flash_d64: f("flash_attn_d64_bf16")?,
                 flash_d64_bb: f("flash_attn_d64_bb")?,
                 flash_d256_bb: f("flash_attn_d256_bb")?,
+                flash_d256_packed_bb: f("flash_attn_d256_packed_bb")?,
+                flash_d512_bb,
                 attn_packed_fb: packed("attn_packed_fb")?,
                 qkv_post_warp: {
                     let mut v = Vec::new();
@@ -370,6 +391,11 @@ impl Gpu {
     #[doc(hidden)]
     pub fn set_flash(&mut self, on: bool) {
         self.flash = on;
+    }
+
+    /// Whether the fused flash-style attention kernels are in use (`EGEMMA2_NO_FLASH` turns them off).
+    pub fn flash_on(&self) -> bool {
+        self.flash
     }
 
     /// Copy an activation buffer to the host as float32.
@@ -1112,6 +1138,10 @@ impl Gpu {
                     let ptrs = [q.ptr(s, 0), k.ptr(s, 0), v.ptr(s, 0), o.ptr(s, 0)];
                     return self.flash_launch(f, ptrs, row0, seq, n_heads, n_kv, hd, window);
                 }
+                if self.flash && hd == 512 && n_heads.is_multiple_of(n_kv) {
+                    let ptrs = [q.ptr(s, 0), k.ptr(s, 0), v.ptr(s, 0), o.ptr(s, 0)];
+                    return self.flash_d512_launch(ptrs, 0, seq.div_ceil(64), row0, seq, n_heads, n_kv, window);
+                }
                 let (qs, kvs) = (n_heads * hd, n_kv * hd);
                 let qkv = [q.ptr(s, row0 * qs), k.ptr(s, row0 * kvs), v.ptr(s, row0 * kvs)];
                 self.attention_bf16_core(qkv, o.ptr(s, row0 * qs), true, seq, n_heads, n_kv, hd, window)
@@ -1247,6 +1277,31 @@ impl Gpu {
         unsafe { b.launch(cfg) }.map(|_| ()).map_err(|e| anyhow!("flash attention (tensor cores): {e:?}"))
     }
 
+    /// Launch `flash_attn_d512_bb` (head_dim 512: 8 warps = 4 row groups x 2 channel halves per block of 64 queries, see
+    /// kernels_sm80.cu) on raw q / k / v / out addresses. With `tiles == 0` the sequence occupies rows `row0` ..
+    /// `row0 + seq` and `grid_x` = ceil(seq / 64) blocks cover it; otherwise `tiles` is the device address of
+    /// `grid_x` int triples {row0, len, q0} (one 64-query tile each; `row0` / `seq` are then ignored).
+    #[allow(clippy::too_many_arguments)]
+    fn flash_d512_launch(&self, ptrs: [u64; 4], tiles: u64, grid_x: usize, row0: usize, seq: usize, n_heads: usize, n_kv: usize, window: Option<usize>) -> Result<()> {
+        let cfg = LaunchConfig { grid_dim: (grid_x as u32, n_heads as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: FLASH_D512_SMEM as u32 };
+        let (r0, sq, nh, nkv, win, scale) = (row0 as i32, seq as i32, n_heads as i32, n_kv as i32, window.map(|w| w as i32).unwrap_or(-1), 1.0f32);
+        let (qs, kvs) = ((n_heads * 512) as i32, (n_kv * 512) as i32);
+        let mut b = self.stream.launch_builder(&self.bfk()?.flash_d512_bb);
+        b.arg(&ptrs[0]).arg(&ptrs[1]).arg(&ptrs[2]).arg(&ptrs[3]).arg(&tiles);
+        b.arg(&r0).arg(&sq).arg(&nh).arg(&nkv).arg(&win).arg(&scale).arg(&qs).arg(&kvs);
+        unsafe { b.launch(cfg) }.map(|_| ()).map_err(|e| anyhow!("flash attention, head_dim 512 (tensor cores): {e:?}"))
+    }
+
+    /// Registers per thread, local-memory (spill) bytes per thread and dynamic shared memory bytes of the head_dim 512
+    /// flash kernel (bf16 mode), for `examples/check_attention.rs`.
+    #[doc(hidden)]
+    pub fn flash_d512_info(&self) -> Result<(i32, i32, usize)> {
+        let f = &self.bfk()?.flash_d512_bb;
+        let regs = f.num_regs().map_err(|e| anyhow!("{e:?}"))?;
+        let local = f.local_size_bytes().map_err(|e| anyhow!("{e:?}"))?;
+        Ok((regs, local, FLASH_D512_SMEM))
+    }
+
     /// Overwrite the start of `dst` with `x` (host -> existing device buffer).
     pub fn upload_into(&self, x: &[f32], dst: &mut Buf) -> Result<()> {
         let mut view = dst.slice_mut(0..x.len());
@@ -1373,6 +1428,83 @@ impl Gpu {
         let mut b = self.stream.launch_builder(f);
         b.arg(&ptrs[0]).arg(&ptrs[1]).arg(&ptrs[2]).arg(&ptrs[3]).arg(seg_start).arg(seg_len).arg(&r).arg(&kv).arg(&win);
         unsafe { b.launch(launch_1d(rows * n_kv * (group / hw) * 32)) }.map(|_| ()).map_err(|e| anyhow!("attn_packed (bf16): {e:?}"))
+    }
+
+    /// The tensor-core kernel that runs a packed pass's attention for head_dim `hd` (bf16 mode with flash attention
+    /// on), if there is one: the single place that decides which head widths take the flash path. Other widths stay
+    /// on the float32 [`attention_packed_act`](Self::attention_packed_act) kernel.
+    fn packed_flash_kernel(&self, hd: usize) -> Option<&CudaFunction> {
+        let bf = self.bf.as_ref().filter(|_| self.flash)?;
+        match hd {
+            256 => Some(&bf.flash_d256_packed_bb),
+            512 => Some(&bf.flash_d512_bb),
+            _ => None,
+        }
+    }
+
+    /// Whether [`attention_flash_packed`](Self::attention_flash_packed) has a kernel for this head layout. Layers
+    /// that do not run on it use [`attention_packed_act`](Self::attention_packed_act) (float32 q/k/v), those that do
+    /// need bf16 q/k/v.
+    pub fn packed_flash_supported(&self, n_heads: usize, n_kv: usize, hd: usize) -> bool {
+        n_kv > 0 && n_heads.is_multiple_of(n_kv) && self.packed_flash_kernel(hd).is_some()
+    }
+
+    /// Tile list for [`attention_flash_packed`](Self::attention_flash_packed): sequences of `lens` rows packed back
+    /// to back from row `row0` become int triples {row0, len, q0}, one per [`FLASH_TILE_ROWS`] queries (q0 = the
+    /// tile's first query within its sequence), followed by len-0 padding tiles up to at least `pad_to` tiles (a
+    /// recorded CUDA graph has a fixed grid). The list never needs more than one tile per row.
+    pub fn flash_packed_tiles(row0: usize, lens: &[usize], pad_to: usize) -> Vec<i32> {
+        let mut tiles: Vec<i32> = Vec::with_capacity(3 * pad_to.max(lens.len()));
+        let mut start = row0;
+        for &len in lens {
+            for q0 in (0..len).step_by(FLASH_TILE_ROWS) {
+                tiles.extend([start as i32, len as i32, q0 as i32]);
+            }
+            start += len;
+        }
+        tiles.resize(tiles.len().max(3 * pad_to), 0);
+        tiles
+    }
+
+    /// Bidirectional attention over many short sequences packed back to back, as one tensor-core launch (the packed
+    /// counterpart of [`attention_act`](Self::attention_act)'s flash path; bf16 mode, bf16 q/k/v/out). `tiles` holds
+    /// at least `n_tiles` tiles from [`flash_packed_tiles`](Self::flash_packed_tiles); tiles of length 0 do nothing,
+    /// rows outside the listed sequences are not touched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_packed(
+        &self,
+        q: &Act,
+        k: &Act,
+        v: &Act,
+        out: &mut Act,
+        tiles: &CudaView<'_, i32>,
+        n_tiles: usize,
+        n_heads: usize,
+        n_kv: usize,
+        hd: usize,
+        window: Option<usize>,
+    ) -> Result<()> {
+        ensure!(q.is_bf16() && k.is_bf16() && v.is_bf16() && out.is_bf16(), "internal: packed flash attention takes bf16 q/k/v/out");
+        ensure!(self.packed_flash_supported(n_heads, n_kv, hd), "packed flash attention: unsupported layout ({n_heads} heads, {n_kv} kv heads, head_dim {hd})");
+        ensure!(tiles.len() >= 3 * n_tiles, "internal: tile list of {} ints holds fewer than {n_tiles} tiles", tiles.len());
+        let f = self.packed_flash_kernel(hd).ok_or_else(|| anyhow!("packed flash attention: no kernel for head_dim {hd}"))?;
+        if n_tiles == 0 {
+            return Ok(());
+        }
+        let s = &self.stream;
+        let ptrs = [q.ptr(s, 0), k.ptr(s, 0), v.ptr(s, 0), out.ptr(s, 0)];
+        if hd == 512 {
+            // Its own block shape and dynamic shared memory; the same tile-list contract.
+            return self.flash_d512_launch(ptrs, tiles.device_ptr(s).0, n_tiles, 0, 0, n_heads, n_kv, window);
+        }
+        let cfg = LaunchConfig { grid_dim: (n_tiles as u32, n_heads as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        // row0 / seq are unused in tile mode.
+        let (r0, sq, nh, nkv, win, scale) = (0i32, 0i32, n_heads as i32, n_kv as i32, window.map(|w| w as i32).unwrap_or(-1), 1.0f32);
+        let (qs, kvs) = ((n_heads * hd) as i32, (n_kv * hd) as i32);
+        let mut b = self.stream.launch_builder(f);
+        b.arg(&ptrs[0]).arg(&ptrs[1]).arg(&ptrs[2]).arg(&ptrs[3]).arg(tiles);
+        b.arg(&r0).arg(&sq).arg(&nh).arg(&nkv).arg(&win).arg(&scale).arg(&qs).arg(&kvs);
+        unsafe { b.launch(cfg) }.map(|_| ()).map_err(|e| anyhow!("packed flash attention: {e:?}"))
     }
 
     // -----------------------------------------------------------------------------------------
