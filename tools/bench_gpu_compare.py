@@ -56,17 +56,19 @@ results = {}
 for name, cmd, out in configs:
     results[name] = run(name, cmd, os.path.join(DATA, out))
 
-cases = ["short (17 tok)", "long (2208 tok)", "batch of 64 short docs", "image 641x479", "audio 9.3 s"]
+cases = ["short (17 tok)", "long (2208 tok)", "batch of 64 short docs", "image 641x479", "16 images 641x479, batched", "audio 9.3 s"]
+per_item = {"16 images 641x479, batched": 16}  # batched cases are reported per item
+ms = lambda n, c: results[n][c]["median_ms"] / per_item.get(c, 1)
 names = list(results)
-print("\nmedian ms (lower is better)")
-print(f"{'workload':<24}" + "".join(f"{n:>20}" for n in names))
+print("\nmedian ms (lower is better; batched images: per image)")
+print(f"{'workload':<28}" + "".join(f"{n:>20}" for n in names))
 for c in cases:
-    print(f"{c:<24}" + "".join(f"{results[n][c]['median_ms']:>20.1f}" for n in names))
-print(f"{'VRAM rise (MB)':<24}" + "".join(f"{results[n]['_vram_rise_mb']:>20}" for n in names))
+    print(f"{c:<28}" + "".join(f"{ms(n, c):>20.1f}" for n in names))
+print(f"{'VRAM rise (MB)':<28}" + "".join(f"{results[n]['_vram_rise_mb']:>20}" for n in names))
 print("\nRust speed-up vs PyTorch at the same precision:")
 for prec in ["fp32", "tf32", "bf16"]:
     t, r = results[f"PyTorch CUDA {prec}"], results[f"Rust CUDA {prec}"]
-    print(f"  {prec}: " + ", ".join(f"{c.split(' (')[0]} {t[c]['median_ms'] / r[c]['median_ms']:.2f}x" for c in cases))
+    print(f"  {prec}: " + ", ".join(f"{c.split(' (')[0].split(',')[0]} {t[c]['median_ms'] / r[c]['median_ms']:.2f}x" for c in cases))
 for n in names:
     a = results[n].get("_accuracy_vs_fp32_cpu")
     if a:

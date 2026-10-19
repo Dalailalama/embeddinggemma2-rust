@@ -1,5 +1,6 @@
-"""Extra reference cases: prompts placed before media, long audio (> 11.2 s, > 30 s), sub-1 fps video."""
-import json, os, subprocess, sys, wave
+"""Extra reference cases: prompts placed before media, long audio (> 11.2 s, > 30 s), sub-1 fps video, and a
+text longer than 8192 tokens (sentence-transformers does not truncate this model's inputs)."""
+import json, os, random, subprocess, sys, wave
 import av, numpy as np, torch
 from PIL import Image
 from sentence_transformers import SentenceTransformer
@@ -50,4 +51,12 @@ with av.open(mp4) as c:
 md = VideoMetadata(total_num_frames=len(frames), fps=fps, duration=len(frames) / fps)
 idx = [int(i) for i in vp.sample_frames(md, fps=vp.fps, max_frames=vp.max_frames, overflow_strategy=vp.overflow_strategy)]
 add("video_05fps", {"video": [frames[i] for i in idx]}, video=mp4, indices=idx, decoded=len(frames), fps=fps)
+# 4. A ~10 000-token text: more than the 8192 tokens egemma2 used to cut texts at.
+rng = random.Random(10000)
+words = ("model embedding vector search query document page paper section result table figure method data "
+         "training sample image audio video token layer attention window global local memory device kernel "
+         "batch length limit north river city music history science energy market garden winter summer").split()
+sentences = [" ".join(rng.choice(words) for _ in range(rng.randint(6, 18))).capitalize() + "." for _ in range(900)]
+long_text = " ".join(sentences)
+add("long_text", long_text, "Document", text=long_text)
 json.dump(res, open(os.path.join(OUT, "ref_extra.json"), "w"))

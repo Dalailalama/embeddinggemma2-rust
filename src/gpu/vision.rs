@@ -1,5 +1,7 @@
-//! Vision tower on the GPU (mirrors `crate::vision::VisionTower::encode`). Position tables,
-//! RoPE tables and the final pooling/projection stay on the host (they are cheap).
+//! Vision tower on the GPU (mirrors `crate::vision::VisionTower::encode`). The input scaling, position
+//! embeddings, RoPE tables and the final pooling run on the device too, with the host's arithmetic (so
+//! only the patches go up and the pooled states come down); the multimodal embedder after the pooling
+//! (RMSNorm + a small projection) stays on the host.
 //!
 //! Like the text tower, a layer is a handful of fused launches working in scratch buffers that are
 //! allocated once per image: q/k/v and gate/up are single GEMMs when no clamping is configured,
@@ -9,6 +11,7 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use super::{Buf, Gpu, GpuLinear};
+use cudarc::driver::CudaSlice;
 use crate::imageproc::PatchedImage;
 use crate::vision::{VisionHead, VisionTower};
 
@@ -44,6 +47,10 @@ pub struct GpuVision {
     gpu: Arc<Gpu>,
     input_proj: GpuLinear,
     layers: Vec<Layer>,
+    /// `head`'s position tables `[2, pe, hidden]`.
+    pos_table: Buf,
+    /// Per-axis RoPE tables `[pe, head_dim / 4]` (cos, sin).
+    rope_axis: (Buf, Buf),
 }
 
 impl GpuVision {
@@ -81,7 +88,10 @@ impl GpuVision {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { input_proj: GpuLinear::from_cpu(g, &input_proj)?, head, layers, gpu })
+        let (cos, sin) = head.rope_axis_tables();
+        let rope_axis = (g.upload(&cos)?, g.upload(&sin)?);
+        let pos_table = g.upload(head.pos_table())?;
+        Ok(Self { input_proj: GpuLinear::from_cpu(g, &input_proj)?, head, layers, gpu, pos_table, rope_axis })
     }
 
     pub fn encode(&self, img: &PatchedImage) -> Result<Vec<f32>> {
@@ -92,23 +102,21 @@ impl GpuVision {
         let n = img.n_patches();
         let eps = cfg.rms_norm_eps;
 
-        // Position embeddings are added on the host to the projected patches: same arithmetic
-        // as the CPU path (projection first, then `+ pos_x + pos_y`).
-        let mut pos = vec![0f32; n * h];
-        head.add_positions(&mut pos, img);
-        let (cos, sin) = head.rope_tables(img);
-
-        // Host-side (rayon) work happens before taking the device lock: the lock is not re-entrant,
-        // and a rayon worker that blocks on it could otherwise be asked to run another embed call.
-        let scaled = VisionHead::scaled_patches(img);
+        // No rayon work while the device lock is held: the lock is not re-entrant, and a rayon worker that
+        // blocks on it could otherwise be asked to run another embed call.
+        let positions: Vec<i32> = img.positions.iter().flat_map(|&[x, y]| [x as i32, y as i32]).collect();
         let g = &*self.gpu;
-        let hidden_host = {
+        let pooled_host = {
             let _guard = g.lock();
             g.mark("start");
-            let x = g.upload(&scaled)?;
+            let mut x = g.upload(&img.patches)?;
+            g.vision_scale_patches(&mut x)?;
+            let pos: CudaSlice<i32> = g.upload_i32(&positions)?;
+            // Same arithmetic as the CPU path: projection first, then `+ (pos_x + pos_y)`.
             let mut hidden = self.input_proj.forward(g, &x, n)?;
-            g.add(&mut hidden, &g.upload(&pos)?)?;
-            let (cos, sin) = (g.upload(&cos)?, g.upload(&sin)?);
+            g.vision_add_positions(&mut hidden, &self.pos_table, &pos, n, h, cfg.position_embedding_size)?;
+            let (mut cos, mut sin) = (g.alloc(n * hd)?, g.alloc(n * hd)?);
+            g.vision_rope_tables(&mut cos, &mut sin, &self.rope_axis.0, &self.rope_axis.1, &pos, n, hd)?;
 
             // Scratch buffers shared by all layers (the fused-projection ones only when some layer uses them).
             // In bf16 mode the products' inputs and outputs are bf16, except the outputs of layers with a bias
@@ -201,8 +209,12 @@ impl GpuVision {
                 g.add_norm_act(&mut hidden, &o, &l.post_ff_ln, next, n, h, eps, 1.0)?;
                 g.mark("vision: add_norm");
             }
-            g.download(&hidden)?
+            let k = cfg.pooling_kernel_size;
+            let mut pooled = g.alloc((img.grid_h / k) * (img.grid_w / k) * h)?;
+            g.vision_pool(&mut pooled, &hidden, img.grid_h, img.grid_w, k, h, (h as f32).sqrt())?;
+            g.download(&pooled)?
         };
-        Ok(head.pool_and_embed(&hidden_host, img))
+        let rows = pooled_host.len() / h;
+        Ok(head.embed_pooled(pooled_host, rows))
     }
 }

@@ -245,6 +245,41 @@ extern "C" __global__ void gelu_mul_gu(float* out, const float* gu, long long n,
     out[i] = gelu_tanh(src[c]) * src[ff + c];
 }
 extern "C" __global__ void add(float* a, const float* b, long long n) { ELEMWISE_IDX a[i] += b[i]; }
+
+// ---- Vision tower input and output steps (each repeats the host arithmetic exactly) ----
+// x = 2 * (x - 0.5): patch pixels to [-1, 1], the input of input_proj.
+extern "C" __global__ void vision_scale_patches(float* x, long long n) { ELEMWISE_IDX x[i] = 2.0f * (x[i] - 0.5f); }
+
+// hidden[t, c] += pos_x[x_t, c] + pos_y[y_t, c]; table = [2, pe, h] (x rows, then y rows), pos = [n, 2] (x, y).
+extern "C" __global__ void vision_add_positions(float* hidden, const float* table, const int* pos, long long n, int h, int pe) {
+    ELEMWISE_IDX
+    long long t = i / h; int c = (int)(i % h);
+    hidden[i] += table[(long long)pos[2 * t] * h + c] + table[((long long)pe + pos[2 * t + 1]) * h + c];
+}
+
+// Axial RoPE tables [rows, hd] gathered from per-axis tables [pe, hd / 4]: the first half of each row rotates
+// with x, the second with y, each half in split-halves layout (frequency j at columns j and j + hd / 4).
+extern "C" __global__ void vision_rope_tables(float* cos, float* sin, const float* cos_ax, const float* sin_ax, const int* pos, long long n, int hd) {
+    ELEMWISE_IDX
+    long long t = i / hd; int c = (int)(i % hd);
+    int half = hd / 2, q = hd / 4;
+    long long src = (long long)pos[2 * t + c / half] * q + (c % half) % q;
+    cos[i] = cos_ax[src];
+    sin[i] = sin_ax[src];
+}
+
+// k x k average pooling of the [gh * gw, h] patch states in row-major block order, times `root`; each sum runs
+// over dy, then dx, like the host loop: out[o, c] = (sum / (k * k)) * root.
+extern "C" __global__ void vision_pool(float* out, const float* x, long long n, int h, int gw, int k, float root) {
+    ELEMWISE_IDX
+    long long o = i / h; int c = (int)(i % h);
+    int ow = gw / k;
+    int oy = (int)(o / ow), ox = (int)(o % ow);
+    float acc = 0.0f;
+    for (int dy = 0; dy < k; dy++)
+        for (int dx = 0; dx < k; dx++) acc += x[((long long)(oy * k + dy) * gw + ox * k + dx) * h + c];
+    out[i] = (acc / (float)(k * k)) * root;
+}
 extern "C" __global__ void scale(float* a, float s, long long n) { ELEMWISE_IDX a[i] *= s; }
 extern "C" __global__ void clamp(float* a, float lo, float hi, long long n) { ELEMWISE_IDX a[i] = fminf(fmaxf(a[i], lo), hi); }
 extern "C" __global__ void clamp_copy(float* out, const float* in, float lo, float hi, long long n) {

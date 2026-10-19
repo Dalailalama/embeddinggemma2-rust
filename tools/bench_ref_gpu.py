@@ -40,6 +40,7 @@ cases = {
     "long (2208 tok)": lambda: m.encode(bench["long"]),
     "batch of 64 short docs": lambda: m.encode(bench["batch64"], batch_size=64),
     "image 641x479": lambda: m.encode({"image": img}),
+    "16 images 641x479, batched": lambda: m.encode([{"image": img}] * 16, batch_size=16),
     "audio 9.3 s": lambda: m.encode({"audio": wav}),
 }
 res = {}

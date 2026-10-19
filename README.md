@@ -10,7 +10,8 @@ A from-scratch Rust port of [`google/embeddinggemma-2`](https://huggingface.co/g
 text, images, audio and video embedded into one 768-d space, with Matryoshka truncation to
 512 / 256 / 128. It runs on the CPU in `f32` or on an NVIDIA GPU through CUDA in fp32, TF32 or bf16
 (cuBLAS plus runtime-compiled kernels, including tensor-core flash attention; the CUDA libraries are
-loaded dynamically). It needs no Python or PyTorch at runtime.
+loaded dynamically). It needs no Python or PyTorch at runtime, and `egemma2 serve` keeps the model
+loaded behind a JSON-lines or OpenAI-compatible HTTP interface for applications in any language.
 
 **Unofficial:** an independent implementation, not affiliated with or endorsed by Google.
 Code: <https://github.com/Dalailalama/embeddinggemma2-rust> · Hugging Face:
@@ -32,27 +33,27 @@ Gemma 4 vision/audio towers) and checked number-for-number against it:
 ## Parity with the original (PyTorch, float32)
 
 `egemma2 verify` / `cargo test --release` compare against dumps produced by `tools/ref_*.py`
-with transformers 5.19 + sentence-transformers 6.1. There are 90 checks:
+with transformers 5.19 + sentence-transformers 6.1. There are 92 checks:
 
 | Check | Max abs. difference (CPU) | Notes |
 |---|---|---|
 | Text embeddings (17 – 2,208 tokens, 4 prompts, multilingual, code) | 4e-7 | token ids identical; 512/256/128-d identical; packed batches identical |
 | Image preprocessing (4 sizes, up- and down-scaling) | 6e-8 | bit-exact port of PyTorch's uint8 antialiased bicubic resize |
-| Image soft tokens / embeddings (incl. text+image, two images) | 2e-4 / 1e-6 | soft-token magnitude ~6 |
+| Image soft tokens / embeddings (incl. text+image, two images, a packed batch of images and text) | 2e-4 / 1e-6 | soft-token magnitude ~6 |
 | Audio log-mel / soft tokens / embeddings (0.5 – 9.3 s) | 5e-7 / 2e-4 / 8e-7 | |
 | Video frame sampling (15 cases) / embeddings | exact / 2e-7 | |
 | Video files decoded by ffmpeg (mp4: lossless RGB and yuv420p H.264) | exact frames | bit-for-bit equal to the reference's PyAV decode |
-| Extra cases (`tools/ref_extra.py`): prompt before an image / text+image / image+text, 20 s and 40 s audio, a 0.5 fps video | 5e-7 | token ids identical; confirms there is no 11.2 s audio cap, the 30 s truncation, and frame repetition below 1 fps |
+| Extra cases (`tools/ref_extra.py`): prompt before an image / text+image / image+text, 20 s and 40 s audio, a 0.5 fps video, an 11,774-token text | 5e-7 | token ids identical; confirms there is no 11.2 s audio cap, the 30 s truncation, frame repetition below 1 fps, and no text truncation |
 
 These are float32 rounding differences; cosine similarity with the reference prints as
 `1.00000000` everywhere.
 
 | Backend | Tolerance profile | Largest embedding difference | Result |
 |---|---|---|---|
-| CPU, float32 | float32 (embeddings <= 5e-6) | 9.9e-7 | 90 / 90 |
-| CUDA, float32 (default) | float32 (embeddings <= 5e-6) | 8.4e-7 | 90 / 90 |
-| CUDA, `--tf32` | tf32 (embeddings <= 1e-3 **and** cosine >= 0.99999) | 4.3e-4, min cosine 0.9999946 | 90 / 90 |
-| CUDA, `--bf16` | bf16 (embeddings <= 4e-3 **and** cosine >= 0.99991) | 1.4e-3, min cosine 0.9999625 | 90 / 90 |
+| CPU, float32 | float32 (embeddings <= 5e-6) | 9.9e-7 | 92 / 92 |
+| CUDA, float32 (default) | float32 (embeddings <= 5e-6) | 8.4e-7 | 92 / 92 |
+| CUDA, `--tf32` | tf32 (embeddings <= 1e-3 **and** cosine >= 0.99999) | 4.3e-4, min cosine 0.9999946 | 92 / 92 |
+| CUDA, `--bf16` | bf16 (embeddings <= 4e-3 **and** cosine >= 0.99991) | 1.4e-3, min cosine 0.9999625 | 92 / 92 |
 
 TF32 rounds GEMM inputs to a 10-bit mantissa, so `--tf32` gets its own, measured tolerance profile.
 The max-abs bound has about 2.3x headroom over the worst case seen. The cosine floor stops a real bug
@@ -73,34 +74,48 @@ PyTorch 2.14.1 + transformers 5.19 + sentence-transformers 6.1 with its default 
 
 | Workload | PyTorch fp32 | **Rust fp32** | PyTorch TF32 | **Rust TF32** | PyTorch bf16 | **Rust bf16** |
 |---|---|---|---|---|---|---|
-| short query (17 tokens) | 45.4 ms | **4.1 ms** (11x) | 45.6 ms | **3.6 ms** (12.7x) | 52.9 ms | **2.6 ms** (20x) |
-| long document (2,208 tokens) | 297 ms | **190 ms** (1.56x) | 243 ms | **105 ms** (2.3x) | 136 ms | **47.1 ms** (2.9x) |
-| batch of 64 short documents | 217 ms | **156 ms** (1.39x) | 142 ms | **80.4 ms** (1.77x) | 119 ms | **45.1 ms** (2.6x) |
-| image 641x479 | 307 ms | **219 ms** (1.4x) | 237 ms | **136 ms** (1.75x) | 169 ms | **59.1 ms** (2.9x) |
-| audio 9.3 s | 96.8 ms | **52.1 ms** (1.86x) | 85.7 ms | **25.7 ms** (3.3x) | 100 ms | **19.5 ms** (5.1x) |
-| GPU memory (rise over idle) | 3.7 GB | **2.5 GB** | 3.7 GB | **2.5 GB** | 2.2 GB | **1.3 GB** |
+| short query (17 tokens) | 38.9 ms | **4.1 ms** (9.5x) | 45.1 ms | **3.6 ms** (12.6x) | 52.3 ms | **2.5 ms** (21x) |
+| long document (2,208 tokens) | 297 ms | **193 ms** (1.54x) | 245 ms | **107 ms** (2.3x) | 136 ms | **47.6 ms** (2.85x) |
+| batch of 64 short documents | 221 ms | **154 ms** (1.44x) | 142 ms | **81.6 ms** (1.74x) | 121 ms | **46.0 ms** (2.6x) |
+| image 641x479, one per call | 322 ms | **217 ms** (1.48x) | 234 ms | **132 ms** (1.77x) | 183 ms | **53.7 ms** (3.4x) |
+| 16 images per call, per image | 283 ms | **204 ms** (1.39x) | 206 ms | **128 ms** (1.61x) | 99.9 ms | **51.4 ms** (1.94x) |
+| audio 9.3 s | 98.0 ms | **51.8 ms** (1.89x) | 90.4 ms | **25.8 ms** (3.5x) | 91.0 ms | **18.9 ms** (4.8x) |
+| GPU memory (peak rise over idle) | 6.0 GB | **2.5 GB** | 6.0 GB | **2.6 GB** | 3.5 GB | **1.4 GB** |
 | worst cosine vs. fp32 reference | 1.0000000 | 1.0000000 | 0.999997 | 0.9999946 | 0.99975 | 0.9999625 |
 
 Speed-ups are Rust vs. PyTorch at the same precision; all six columns come from one run of
 `tools/bench_gpu_compare.py`. bf16 is the model card's recommendation on GPUs. **Rust bf16 is the
-fastest configuration on every workload: 2.6 - 20x faster than PyTorch bf16, with 40% less GPU
-memory, and about 7x closer to the float32 reference** (1 - cos 3.7e-5 vs. 2.5e-4). PyTorch's image
-time varies more than the rest between runs (151 - 169 ms over the last two), so read that ratio as
-2.5 - 2.9x. Rust TF32 also beats PyTorch bf16 on all five workloads while staying ~50x closer to the
-reference; PyTorch bf16 is still faster than Rust *fp32* on the long document, the batch and the
-image. Worst cosines for Rust are over the 90 `verify` checks; for PyTorch, over the four benchmark
-inputs (the audio clip in both reduced-precision modes).
+fastest configuration on every workload: 1.9 - 21x faster than PyTorch bf16, with 60% less GPU
+memory, and about 7x closer to the float32 reference** (1 - cos 3.7e-5 vs. 2.5e-4). PyTorch's
+single-image time varies more than the rest between runs (151 - 183 ms over the last three; 165 ms
+at best in this one), so read that ratio as 2.8 - 3.4x. Rust TF32 also beats PyTorch bf16 on every
+workload except batched images, while staying ~50x closer to the reference; PyTorch bf16 is still
+faster than Rust *fp32* on the long document, the batch and the images. The memory row is the peak
+over all workloads, which for PyTorch is the 16-image batch. Worst cosines for Rust are over the 92
+`verify` checks; for PyTorch, over the four benchmark inputs (the audio clip in both
+reduced-precision modes).
 
-The short query is where the gap is biggest. PyTorch takes 45 - 53 ms on the GPU, about as long as on
+The short query is where the gap is biggest. PyTorch takes 39 - 52 ms on the GPU, about as long as on
 the CPU (48 ms), so its short-query time is fixed per-call overhead rather than compute. Rust replays
-the 17-token pass from a recorded CUDA graph in 2.6 - 4 ms. The large inputs are bound by
+the 17-token pass from a recorded CUDA graph in 2.5 - 4 ms. The large inputs are bound by
 matrix-multiply throughput and memory traffic on both sides, so the margin there is smaller:
-1.4 - 1.9x at fp32, 1.75 - 3.3x with TF32 and 2.6 - 5x with bf16. In bf16 mode three steps took the
+1.4 - 1.9x at fp32, 1.6 - 3.5x with TF32 and 1.9 - 4.8x with bf16. In bf16 mode three steps took the
 large inputs most of the way (see [GPU](#gpu-cuda)): storing the tensors around each matrix product
 as bf16 (long document 79.6 -> 62.8 ms, batch 69.1 -> 53.6 ms, image 79.2 -> 62.2 ms), tensor-core
 flash attention for the text's sliding-window layers and the vision tower (long document 50.0 ms,
 image 59.2 ms), and flash kernels for the text's 512-wide global layers and for packed batches of
 short texts (long document 47.1 ms, batch 45.1 ms).
+
+**Many images.** One image per call is PyTorch's slowest way to embed images: batched 16 at a time
+(`model.encode(images, batch_size=16)`), bf16 PyTorch drops from 165 - 183 ms to 99.9 ms per image,
+because the batch keeps the GPU busy through its per-call overhead. Rust's batched path
+(`embed_batch`, `embed --image a.png --image b.png ...`, or one `serve` request with several images)
+takes 51.4 ms per image, so for bulk image work, such as indexing the pages of PDFs, expect about
+1.9x rather than 3.4x. Batching saves Rust little because its vision tower already keeps the GPU
+busy: about 40 ms of device time per image, mostly the matrix products and attention over the
+~2,400 patches of a full-size image. A batch saves the per-image host work, and the text pass packs
+several images' soft tokens into one pass. Moving the vision tower's position embeddings, RoPE
+tables and pooling onto the GPU (0.3.0) took one image from 58.4 to 53.4 ms.
 
 ### CPU vs. CPU
 
@@ -201,8 +216,18 @@ egemma2 bench
 ```
 
 Output is JSON: `{"dim": 768, "inputs": [...], "embeddings": [[...], ...]}`. Use `--out file.json`
-to write it to a file. The first line on stderr, `model loaded on cpu` / `cuda:0` /
-`cuda:0 (tf32)`, tells you which device was actually used.
+to write it to a file, or `--jsonl` for one `{"input", "embedding"}` object per line, written as
+the inputs are embedded. `--text-file docs.txt` embeds every line of a file (`-` reads stdin;
+empty lines included, so line N is embedding N). Inputs are batched into shared passes. The first
+line on stderr, `model loaded on cpu` / `cuda:0` / `cuda:0 (tf32)`, tells you which device was
+actually used.
+
+Each `egemma2 embed` call loads the model again (1 - 3 s). For more than a handful of calls, keep
+one process running with `egemma2 serve` instead (next section).
+
+**Text length.** Texts are not cut by default, which matches sentence-transformers (this model's
+`max_seq_length` there is unbounded). `--max-tokens N` cuts longer texts to their first N - 1
+tokens plus `<eos>`. Memory grows with the length: see [Long texts](#long-texts).
 
 **Prompts.** Like sentence-transformers, which passes the prompt to this model as a system message,
 `--prompt-name` puts the prompt before the whole input, before an image or audio clip too. The model
@@ -210,11 +235,119 @@ card applies prompts to text only, so leave `--prompt-name` off for image/audio/
 unless you want that. Text values may start with `-` (`--text "- a bullet"`).
 
 Global flags (accepted before or after the subcommand): `--model-dir` (default
-`models/embeddinggemma-2`), `--device`, `--tf32`, `--bf16`, `--threads`, `--small-threads`. `embed` also takes
-`--prompt-name`, `--dim`, `--fps`, `--combine`, `--max-audio-seconds`, `--pil-resize` (Pillow's
-resampler instead of PyTorch's) and `--out`; `similarity` takes `--query`, `--doc`, `--docs-file` and
-`--dim`; `verify` takes `--reference-dir` and `--only text|image|audio|video|extra`; `bench` takes
-`--data-dir`, `--iters` and `--out`.
+`models/embeddinggemma-2`), `--device`, `--tf32`, `--bf16`, `--max-tokens`, `--threads`,
+`--small-threads`. `embed` also takes `--text-file`, `--prompt-name`, `--dim`, `--fps`, `--combine`,
+`--max-audio-seconds`, `--pil-resize` (Pillow's resampler instead of PyTorch's), `--jsonl` and
+`--out`; `serve` takes the options described below; `similarity` takes `--query`, `--doc`,
+`--docs-file` and `--dim`; `verify` takes `--reference-dir` and `--only text|image|audio|video|extra`;
+`bench` takes `--data-dir`, `--iters` and `--out`.
+
+## Server mode: keep the model loaded
+
+`egemma2 serve` loads the model once and answers requests until stopped, so an application pays the
+load time once instead of on every call. It speaks the OpenAI embeddings format, over two transports:
+
+```bash
+# JSON lines on stdin/stdout: drive egemma2 as a subprocess from any language
+egemma2 --device cuda --bf16 serve
+
+# HTTP: POST /v1/embeddings (OpenAI-compatible), GET /health, GET /v1/models
+egemma2 --device cuda --bf16 serve --http 127.0.0.1:8080
+```
+
+A request (one line on stdin, or the POST body):
+
+```json
+{"input": ["what is this paper about?", {"image": "page1.png"}, {"text": "Figure 3:", "image": "fig3.png"}],
+ "prompt_name": "SearchQuery", "dimensions": 256}
+```
+
+and its response, one embedding per input in order:
+
+```json
+{"object": "list", "data": [{"object": "embedding", "index": 0, "embedding": [0.0213, -0.0871, ...]}, ...],
+ "model": "embeddinggemma-2", "usage": {"prompt_tokens": 291, "total_tokens": 291}}
+```
+
+| Field | Meaning |
+|---|---|
+| `input` | a string, one input, or a list of inputs. An input is a string (text) or an object: `text`, `image`, `audio` and `video` keys form **one** interleaved input in key order (as with sentence-transformers' dict inputs), `{"parts": [...]}` takes any sequence (two images, say), and OpenAI-style content parts (`{"type": "image_url", "image_url": {"url": ...}}`) work too. Token-id arrays are refused with a hint. |
+| media values | a file path, a `data:<type>;base64,...` URL, or an object: `{"path"}`, `{"base64"}`, raw pixels `{"rgb": <base64 RGB8, row-major>, "width", "height"}` (no encoding step for images you already have in memory), raw audio `{"pcm_f32": <base64 little-endian f32>, "sample_rate"}`, a video as a list of frames (`[image, ...]` or `{"frames": [...]}`) with an optional `fps`. Audio files are WAV; remote URLs are not fetched. Relative paths are relative to the server's working directory. |
+| `prompt_name` / `prompt` | a prompt name (`SearchQuery`, `Document`, ...) or a literal prompt, placed before the whole input. Without one, a `model` that names a prompt selects it, then `serve --prompt-name` applies. |
+| `dimensions` (or `dim`) | Matryoshka truncation, re-normalised (768, 512, 256, 128) |
+| `encoding_format` | `float` (default) or `base64` (little-endian f32; what the `openai` Python SDK requests) |
+| `id` | echoed in the stdio response |
+
+Errors come back as `{"error": {"message": ..., "type": ...}}` (HTTP 4xx/5xx), and stdio mode carries
+on with the next line. Requests that arrive together are batched: one worker owns the device and
+merges queued requests into shared passes, while each request's inputs are decoded and preprocessed
+on its own thread, overlapping earlier requests' device work.
+
+**From Python** without any dependency, [`clients/python/egemma2_client.py`](clients/python/egemma2_client.py)
+starts and talks to the stdio server (copy the file into your project):
+
+```python
+from pathlib import Path
+from egemma2_client import Egemma2
+
+with Egemma2(exe="egemma2", model_dir="models/embeddinggemma-2", device="cuda", precision="bf16") as model:
+    docs = model.embed(["first document", "second document"], prompt_name="Document")
+    query = model.embed("what do the documents say?", prompt_name="SearchQuery")[0]
+    pages = model.embed([Path("page1.png"), Path("page2.png")])           # files, chosen by extension
+    mixed = model.embed([{"text": "a photo of", "image": pil_image}])       # Pillow / numpy images too
+    matrix = model.embed_numpy(texts, dimensions=256)                       # (n, 256) float32
+```
+
+**From OpenAI-style clients**, point them at the HTTP server; prompts go in the extra body:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+r = client.embeddings.create(model="embeddinggemma-2", input=["first document"], extra_body={"prompt_name": "Document"})
+```
+
+LangChain's `OpenAIEmbeddings` sends token ids unless given `check_embedding_ctx_length=False`; its
+`model` can be a prompt name, so `OpenAIEmbeddings(model="Document", ...)` embeds documents and
+`model="SearchQuery"` queries.
+
+Measured on the RTX A3000 in bf16 mode: through the Python client, a short query takes 2.6 ms round
+trip, the same as in-process, where each `egemma2 embed` call spends 1 - 3 s loading the model. Over
+HTTP, 512 one-text requests from one client run at 275 texts/s, and from 8 concurrent clients at 865
+texts/s, because the worker merges their requests into packed passes (one request with all 512
+texts: 1,234 texts/s).
+
+**Security.** The HTTP server listens where you tell it; keep it on `127.0.0.1` unless you need
+more. On a non-loopback address it refuses file paths in requests (inline data only) unless started
+with `--allow-file-paths`. Browser requests from other origins are refused unless allowed with
+`--allow-origin`, so a web page cannot use a local server behind your back. `--api-key` (or the
+`EGEMMA2_API_KEY` variable) requires `Authorization: Bearer <key>` on everything except
+`/health`. There is no TLS; put a reverse proxy in front for that. Other options: `--http-threads`
+(threads that receive and preprocess requests, default 4), `--max-request-mb` (default 256),
+`--prompt-name`, `--max-audio-seconds`, `--pil-resize`.
+
+## Long texts
+
+sentence-transformers does not cut this model's inputs, so egemma2 doesn't either (versions up to
+0.2 cut texts at 8,192 tokens). The parity suite includes an 11,774-token text: max diff 1e-7 on
+the CPU and CUDA fp32, 1.9e-5 with TF32, 2.5e-4 in bf16; cut at 8,192 tokens, the same text lands
+at cosine 0.998. `--max-tokens N` (library: `max_text_tokens`) sets a cap if you want one. The model
+was trained on positions up to 262,144.
+
+Longer texts measured on the RTX A3000 (12 GB), `Document` prompt, one text per call:
+
+| Text | Rust bf16 | Rust fp32 | PyTorch fp32 |
+|---|---|---|---|
+| 31,881 tokens | **1.96 s**, 2.9 GB | **8.5 s**, 4.0 GB | 69 s, 19.9 GB peak (spills into system memory) |
+| 63,830 tokens | **6.2 s**, 5.8 GB | **28.6 s**, 7.8 GB | out of memory (asks for 30 GB) |
+| 100,115 tokens | **13.9 s**, 9.1 GB | refused up front: needs 11.8 GB, 10.4 GB free | out of memory (asks for 75 GB) |
+
+At 31,881 tokens the bf16 embedding has cosine 0.99999907 with PyTorch's fp32 one, and fp32 a max
+difference of 1.9e-7. Memory is the weights plus about 120 KB per token in fp32 and 90 KB in bf16;
+the attention scores of the cuBLAS paths are processed in blocks of at most 256 MB, and bf16 mode's
+flash kernels keep them on chip. Before a pass over more than 8,192 tokens, egemma2 checks that the
+GPU has the memory and otherwise fails at once with that message. Without the check, Windows' driver
+pages GPU memory to system RAM and such a pass takes many minutes; that is what slows PyTorch's
+32K-token run. On the CPU, system memory is the limit.
 
 ## GPU (CUDA)
 
@@ -252,8 +385,13 @@ untested.
   attention, GLU, depthwise conv and its two subsampling convolutions) are CUDA kernels in
   `src/gpu/kernels.cu`, compiled by NVRTC when the model is opened on a GPU. The audio front end
   stays exact float32 even under `--tf32`.
-- Still on the host: tokenisation, image resize, log-mel, video decoding, the vision tower's position
-  and RoPE tables, and its final pooling/projection.
+- Still on the host: tokenisation, image resize, log-mel, video decoding, and the vision tower's last
+  step (RMSNorm and a 768 -> 512 projection of the ~266 pooled tokens). Its position embeddings, RoPE
+  tables and 3x3 pooling run on the GPU with the host's arithmetic, bit for bit, so only the patches
+  go up and the pooled tokens come down.
+- Batches (`embed_batch`, `serve`) prepare their inputs on the CPU in parallel (tokenising, resizing,
+  log-mel), then run the towers input by input and the text backbone over packed passes of up to
+  2,048 rows that mix texts and media inputs.
 - Weights are uploaded (as float32, or bf16 in bf16 mode): the text backbone when the model is opened,
   the vision and audio towers the first time an input needs them (once, even with concurrent first calls).
 - **bf16 mode.** Weights stay in bf16 on the GPU. That is the checkpoint's own format, so it is
@@ -308,7 +446,21 @@ let doc_embs = model.embed_batch(&docs, Some(256))?;
 
 // The same on the GPU (`Precision::F32`, `Tf32` or `Bf16`). Returns an error if CUDA can't be
 // initialised; the automatic CPU fallback is a CLI feature (`--device auto`), not a library one.
-let gpu_model = EmbeddingGemma2::load_on("models/embeddinggemma-2", Device::Cuda { ordinal: 0, precision: Precision::Bf16 })?;
+let mut gpu_model = EmbeddingGemma2::load_on("models/embeddinggemma-2", Device::Cuda { ordinal: 0, precision: Precision::Bf16 })?;
+
+// Nothing is cut by default, like sentence-transformers; set a cap if you want one.
+gpu_model.max_text_tokens = Some(8192);
+
+// Split the CPU work from the device work: prepare inputs on any thread (tokenise, resize, log-mel),
+// then embed them together. This is what `embed_batch` and the server do.
+let page = media::load_image(Path::new("page1.png"))?;
+let prepared = vec![gpu_model.prepare_input(&Input::text("first"))?, gpu_model.prepare_input(&Input::image(page))?];
+let embs = gpu_model.embed_prepared(&prepared)?;
+
+// Or serve it (see `embeddinggemma2::serve`): JSON lines on stdin/stdout, or HTTP.
+embeddinggemma2::serve::run_stdio(&gpu_model, &embeddinggemma2::serve::ServeOptions {
+    model_name: "embeddinggemma-2".into(), default_prompt: None, allow_file_paths: true,
+})?;
 ```
 
 ## Code map
@@ -316,6 +468,8 @@ let gpu_model = EmbeddingGemma2::load_on("models/embeddinggemma-2", Device::Cuda
 | File | Contents |
 |---|---|
 | `src/model.rs` | public API, prompt assembly, placeholder expansion, soft-token merge, pooling, batching |
+| `src/serve.rs` | `egemma2 serve`: request format, the device worker that merges queued requests, stdio and HTTP transports |
+| `clients/python/` | `egemma2_client.py` (dependency-free Python client for the stdio server) and its test |
 | `src/backend.rs` | `Device` and the CPU / CUDA dispatch for the three towers |
 | `src/text.rs` | text backbone |
 | `src/vision.rs`, `src/imageproc.rs` | vision tower; resize (PyTorch and Pillow variants) and patchify |
@@ -325,6 +479,7 @@ let gpu_model = EmbeddingGemma2::load_on("models/embeddinggemma-2", Device::Cuda
 | `src/gpu/` | CUDA backend: `mod.rs` (device, fp32/TF32/bf16 cuBLAS GEMMs, attention, kernel launchers, graphs), `text.rs` / `vision.rs` / `audio.rs` (tower forward passes), `kernels.cu` (NVRTC kernels), `kernels_sm80.cu` (bf16 tensor-core flash attention, compute capability 8.0+) |
 | `src/weights.rs`, `src/config.rs` | memory-mapped safetensors (BF16/F16/F32), config files |
 | `src/verify.rs`, `tests/parity.rs` | parity checks and tolerance profiles; parity tests |
+| `tests/serve.rs` | the stdio and HTTP servers end to end, against the library's own embeddings |
 | `examples/` | `check_attention` (flash kernels vs. the cuBLAS path and an exact reference), profiling tools: `profile_passes` (device time per operation of whole GPU passes, run with `EGEMMA2_PROFILE=1`), `profile_gpu` (GEMM and attention shapes per precision), `profile_text`, `profile_image`, `profile_ops` |
 | `tools/` | reference-dump and benchmark scripts (Python, used only for verification), `publish_public.py` (publishes a release snapshot) |
 
@@ -338,8 +493,17 @@ EGEMMA2_DEVICE=cuda EGEMMA2_BF16=1 cargo test --release    # CUDA, bf16 (bf16 to
 ```
 
 `tests/parity.rs` has one test each for text, image, audio, video and the extra cases, all built on
-the checks in `src/verify.rs`; unit tests cover the tolerance profiles, frame sampling, natural
-frame ordering and truncated resampling. Environment variables:
+the checks in `src/verify.rs`. `tests/serve.rs` runs `egemma2 serve` over stdio and HTTP (key
+order, base64 output, errors, API key, origin checks) and compares its embeddings with the
+library's. Unit tests cover the tolerance profiles, frame sampling, natural frame ordering,
+truncated resampling and the server's request parsing. The Python client has its own test against
+the PyTorch reference data:
+
+```bash
+python -m unittest clients/python/test_egemma2_client.py     # needs target/release/egemma2 (or EGEMMA2_EXE)
+```
+
+Environment variables:
 
 | Variable | Meaning |
 |---|---|
@@ -372,6 +536,8 @@ file limit. The pixel check of that 40-frame clip is skipped unless you regenera
   embeds identically to the original). Streams flagged as attached pictures (cover art) are skipped.
   Frame directories are read in natural file-name order (`2.png` before `10.png`). Frame directories
   and animated GIFs work without ffmpeg.
+- **Server:** one model and one device per process, no TLS (use a reverse proxy), WAV-only audio
+  and no fetching of remote URLs. Requests are processed in arrival order by one device worker.
 - The reference is float32. A bfloat16 PyTorch run differs from it by about 1e-3 (cosine ~0.9998).
 - JPEG decoders can differ from Pillow by +-1 per pixel, so JPEG inputs may differ very slightly
   more than the PNG test inputs.

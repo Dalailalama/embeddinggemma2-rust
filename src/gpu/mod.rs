@@ -134,6 +134,10 @@ struct Kernels {
     gelu_mul_gu: CudaFunction,
     add: CudaFunction,
     scale: CudaFunction,
+    vision_scale_patches: CudaFunction,
+    vision_add_positions: CudaFunction,
+    vision_rope_tables: CudaFunction,
+    vision_pool: CudaFunction,
     clamp: CudaFunction,
     clamp_copy: CudaFunction,
     bias_add: CudaFunction,
@@ -250,6 +254,23 @@ fn norm_threads(dim: usize) -> u32 {
     if dim >= 1024 { 256 } else if dim >= 256 { 128 } else { 64 }
 }
 
+/// Bytes the score buffers of one query block of the cuBLAS attention paths may take. The global layers
+/// read every key, so without a bound a 100 000-token text would need 4 heads x 1024 queries x 100 000 keys
+/// x 4 bytes = 1.6 GB per block.
+pub(crate) const ATTN_SCORE_BYTES: usize = 256 << 20;
+
+/// Query rows per block of the cuBLAS attention paths: `max`, or fewer (a multiple of 64) when the scores of
+/// `batch` heads against the keys a block reads (all `seq` of them, or `qb + 2 * window`) would exceed
+/// [`ATTN_SCORE_BYTES`] at `bytes` per score.
+fn attn_q_block(max: usize, batch: usize, seq: usize, window: Option<usize>, bytes: usize) -> usize {
+    let keys = |qb: usize| window.map_or(seq, |w| (qb + 2 * w).min(seq)).max(1);
+    let mut qb = max;
+    while qb > 64 && batch * qb * keys(qb) * bytes > ATTN_SCORE_BYTES {
+        qb -= 64;
+    }
+    qb
+}
+
 fn launch_1d(n: usize) -> LaunchConfig {
     let threads = 256u32;
     LaunchConfig { grid_dim: ((n as u64).div_ceil(threads as u64) as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }
@@ -301,6 +322,10 @@ impl Gpu {
             gelu_mul_gu: f("gelu_mul_gu")?,
             add: f("add")?,
             scale: f("scale")?,
+            vision_scale_patches: f("vision_scale_patches")?,
+            vision_add_positions: f("vision_add_positions")?,
+            vision_rope_tables: f("vision_rope_tables")?,
+            vision_pool: f("vision_pool")?,
             clamp: f("clamp")?,
             clamp_copy: f("clamp_copy")?,
             bias_add: f("bias_add")?,
@@ -447,6 +472,36 @@ impl Gpu {
     /// Serialise use of the stream / cuBLAS handle across host threads.
     pub fn lock(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Fail early when `need` more bytes of device memory would not fit; `what` describes the job for the
+    /// message. Under Windows' WDDM driver an allocation beyond the card's memory does not fail: it spills
+    /// into shared system memory and the pass runs tens of times slower.
+    pub fn ensure_fits(&self, need: usize, what: impl FnOnce() -> String) -> Result<()> {
+        let free = || self.ctx.mem_get_info().map_err(|e| anyhow!("querying free GPU memory: {e:?}"));
+        if need <= free()?.0 {
+            return Ok(());
+        }
+        // Memory cached in the allocator's pool counts as used: hand it back, then look again.
+        self.synchronize()?;
+        unsafe {
+            use cudarc::driver::result;
+            if let Ok(pool) = result::device::get_default_mem_pool(self.ctx.cu_device()) {
+                let _ = result::mem_pool::trim_to(pool, 0);
+            }
+        }
+        let (free, total) = free()?;
+        let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
+        ensure!(
+            need <= free,
+            "{} needs about {:.1} GB of GPU memory, but {:.1} GB of the {:.1} GB is free. Cut long texts with \
+             --max-tokens (library: `max_text_tokens`), use --bf16 (about a quarter less memory), or run on the CPU",
+            what(),
+            gb(need),
+            gb(free),
+            gb(total)
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------------------------
@@ -857,6 +912,41 @@ impl Gpu {
             .map_err(|e| anyhow!("add: {e:?}"))
     }
 
+    /// Vision patches to `[-1, 1]` in place: `x = 2 * (x - 0.5)`.
+    pub fn vision_scale_patches(&self, x: &mut Buf) -> Result<()> {
+        let n = x.len() as i64;
+        unsafe { self.stream.launch_builder(&self.k.vision_scale_patches).arg(x).arg(&n).launch(launch_1d(n as usize)) }
+            .map(|_| ())
+            .map_err(|e| anyhow!("vision_scale_patches: {e:?}"))
+    }
+
+    /// `hidden[t] += table[x_t] + table[pe + y_t]` for `[rows, h]` patch states; `pos` holds `(x, y)` per row.
+    pub fn vision_add_positions(&self, hidden: &mut Buf, table: &Buf, pos: &CudaSlice<i32>, rows: usize, h: usize, pe: usize) -> Result<()> {
+        let (n, hi, pei) = ((rows * h) as i64, h as i32, pe as i32);
+        unsafe { self.stream.launch_builder(&self.k.vision_add_positions).arg(hidden).arg(table).arg(pos).arg(&n).arg(&hi).arg(&pei).launch(launch_1d(rows * h)) }
+            .map(|_| ())
+            .map_err(|e| anyhow!("vision_add_positions: {e:?}"))
+    }
+
+    /// Axial RoPE tables `[rows, hd]` for patch positions `pos`, from per-axis tables `[pe, hd / 4]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vision_rope_tables(&self, cos: &mut Buf, sin: &mut Buf, cos_ax: &Buf, sin_ax: &Buf, pos: &CudaSlice<i32>, rows: usize, hd: usize) -> Result<()> {
+        let (n, hdi) = ((rows * hd) as i64, hd as i32);
+        unsafe { self.stream.launch_builder(&self.k.vision_rope_tables).arg(cos).arg(sin).arg(cos_ax).arg(sin_ax).arg(pos).arg(&n).arg(&hdi).launch(launch_1d(rows * hd)) }
+            .map(|_| ())
+            .map_err(|e| anyhow!("vision_rope_tables: {e:?}"))
+    }
+
+    /// `k x k` average pooling of `[gh * gw, h]` patch states into `[(gh / k) * (gw / k), h]`, times `root`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vision_pool(&self, out: &mut Buf, x: &Buf, gh: usize, gw: usize, k: usize, h: usize, root: f32) -> Result<()> {
+        let rows = (gh / k) * (gw / k);
+        let (n, hi, gwi, ki) = ((rows * h) as i64, h as i32, gw as i32, k as i32);
+        unsafe { self.stream.launch_builder(&self.k.vision_pool).arg(out).arg(x).arg(&n).arg(&hi).arg(&gwi).arg(&ki).arg(&root).launch(launch_1d(rows * h)) }
+            .map(|_| ())
+            .map_err(|e| anyhow!("vision_pool: {e:?}"))
+    }
+
     pub fn scale(&self, a: &mut Buf, s: f32) -> Result<()> {
         let n = a.len() as i64;
         unsafe { self.stream.launch_builder(&self.k.scale).arg(a).arg(&s).arg(&n).launch(launch_1d(n as usize)) }
@@ -978,15 +1068,15 @@ impl Gpu {
         if self.precision == Precision::Bf16 {
             return self.attention_bf16(q, k, v, out, row0, seq, n_heads, n_kv, hd, window);
         }
-        const Q_BLOCK: usize = 1024;
         let (qs, kvs) = (n_heads * hd, n_kv * hd);
         let group = n_heads / n_kv;
         // One batched call over every head when K/V are per head; otherwise one per KV group.
         let (n_calls, batch, kv_stride) = if group == 1 { (1, n_heads, hd) } else { (n_kv, group, 0) };
+        let q_block = attn_q_block(1024, batch, seq, window, 4);
         let win = window.map(|w| w as i32).unwrap_or(-1);
         let mut q0 = 0;
         while q0 < seq {
-            let qb = Q_BLOCK.min(seq - q0);
+            let qb = q_block.min(seq - q0);
             let (k0, k1) = match window {
                 Some(w) => (q0.saturating_sub(w), (q0 + qb - 1 + w + 1).min(seq)),
                 None => (0, seq),
@@ -1156,13 +1246,14 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     fn attention_bf16_core(&self, qkv: [u64; 3], out: u64, out_bf16: bool, seq: usize, n_heads: usize, n_kv: usize, hd: usize, window: Option<usize>) -> Result<()> {
         use cudarc::cublas::result as blas;
-        // Query block: a windowed layer reads qb + 2w keys per block for queries that need only 2w + 1 of
-        // them, so smaller blocks waste less score work, until per-launch overhead wins. Measured on the
-        // 2208-token benchmark text: 1024 -> 80.2 ms, 512 -> 78.5, 256 -> 80.1, 128 -> 83.7.
-        let q_block: usize = if window.is_some() { 512 } else { 1024 };
         let (qs, kvs) = (n_heads * hd, n_kv * hd);
         let group = n_heads / n_kv;
         let (n_calls, batch, kv_stride) = if group == 1 { (1, n_heads, hd) } else { (n_kv, group, 0) };
+        // Query block: a windowed layer reads qb + 2w keys per block for queries that need only 2w + 1 of
+        // them, so smaller blocks waste less score work, until per-launch overhead wins. Measured on the
+        // 2208-token benchmark text: 1024 -> 80.2 ms, 512 -> 78.5, 256 -> 80.1, 128 -> 83.7. Scores take
+        // 6 bytes each (float32 plus the bf16 probabilities).
+        let q_block = attn_q_block(if window.is_some() { 512 } else { 1024 }, batch, seq, window, 6);
         let win = window.map(|w| w as i32).unwrap_or(-1);
         let (qp, kp, vp) = (qkv[0], qkv[1], qkv[2]);
         let (alpha, beta) = (1.0f32, 0.0f32);

@@ -334,6 +334,19 @@ pub fn check_image(model: &EmbeddingGemma2, dir: &Path) -> Result<Vec<Check>> {
             out.push(vec_check(format!("image[{name}] {ek}"), &emb, &json_f32(&c[ek]), tol.embedding, ids_ok, String::new()));
         }
     }
+    // Batched media path: every layout of every image (plus a plain text) in one embed_batch call, so image
+    // sequences share packed backbone passes with each other and with text.
+    let (mut inputs, mut want) = (vec![Input::text("a photo of")], vec![model.embed(&Input::text("a photo of"))?]);
+    for c in meta["cases"].as_array().unwrap() {
+        let img = media::load_image(Path::new(c["png"].as_str().unwrap()))?;
+        inputs.push(Input::image(img.clone()));
+        want.push(json_f32(&c["emb_image"]));
+        inputs.push(Input { parts: vec![Part::Text("a photo of".into()), Part::Image(img)] });
+        want.push(json_f32(&c["emb_text_image"]));
+    }
+    let got = model.embed_batch(&inputs, None)?;
+    out.push(vec_check(format!("image packed batch ({} inputs)", inputs.len()), &got.concat(), &want.concat(), tol.embedding, None, String::new()));
+
     if meta["multi"].get("ids_text_two_images").is_some() {
         let a = media::load_image(&dir.join("img_a_641x479.png"))?;
         let b = media::load_image(&dir.join("img_b_96x64.png"))?;
@@ -452,6 +465,8 @@ pub fn check_extra(model: &EmbeddingGemma2, dir: &Path) -> Result<Vec<Check>> {
                 }
                 Err(e) => return Err(e),
             }
+        } else if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+            parts.push(Part::Text(t.into()));
         }
         let prompt = match c["prompt_name"].as_str() {
             Some(p) => model.prompt(p)?.to_string(),

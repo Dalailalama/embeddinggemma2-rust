@@ -88,6 +88,27 @@ impl VisionHead {
         });
     }
 
+    /// The learned position tables `[2, position_embedding_size, hidden]` (x rows, then y rows).
+    pub(crate) fn pos_table(&self) -> &[f32] {
+        &self.pos_table
+    }
+
+    /// Per-axis RoPE tables `[position_embedding_size, head_dim / 4]` (cos, sin): entry `[p, i]` is the
+    /// rotation of position `p` at frequency `i`, the values [`rope_tables`](Self::rope_tables) lays out.
+    pub(crate) fn rope_axis_tables(&self) -> (Vec<f32>, Vec<f32>) {
+        let hd = self.cfg.head_dim;
+        let inv = ops::rope_inv_freq(self.cfg.rope_parameters.rope_theta, hd / 2);
+        let (mut cos, mut sin) = (Vec::new(), Vec::new());
+        for p in 0..self.cfg.position_embedding_size {
+            for f in &inv {
+                let (s, c) = (p as f32 * f).sin_cos();
+                cos.push(c);
+                sin.push(s);
+            }
+        }
+        (cos, sin)
+    }
+
     /// Axial RoPE tables `[n, head_dim]`: the first half of each head rotates with x, the second
     /// half with y, each half in split-halves layout.
     pub(crate) fn rope_tables(&self, img: &PatchedImage) -> (Vec<f32>, Vec<f32>) {
@@ -138,8 +159,14 @@ impl VisionHead {
                 *o = (*a / denom) * root;
             }
         });
-        ops::rms_norm(&mut pooled, h, None, self.cfg.rms_norm_eps);
-        self.embed_proj.forward(&pooled, oh * ow)
+        self.embed_pooled(pooled, oh * ow)
+    }
+
+    /// The `Gemma4MultimodalEmbedder` over `rows` pooled, scaled states: scale-free RMSNorm, then the
+    /// projection into text space.
+    pub(crate) fn embed_pooled(&self, mut pooled: Vec<f32>, rows: usize) -> Vec<f32> {
+        ops::rms_norm(&mut pooled, self.cfg.hidden_size, None, self.cfg.rms_norm_eps);
+        self.embed_proj.forward(&pooled, rows)
     }
 }
 

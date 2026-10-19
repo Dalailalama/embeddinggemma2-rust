@@ -241,6 +241,29 @@ impl GpuText {
         Ok(replaced)
     }
 
+    /// Device memory a per-sequence (unfused, no graph) pass over `rows` rows allocates: the `new_work` buffers,
+    /// RoPE tables for `max_len` positions and the cuBLAS attention paths' score blocks.
+    fn pass_bytes(&self, rows: usize, max_len: usize) -> usize {
+        let g = &*self.gpu;
+        let cfg = &self.cfg;
+        let (h, p, nl, nh) = (cfg.hidden_size, cfg.hidden_size_per_layer_input, cfg.num_hidden_layers, cfg.num_attention_heads);
+        let widest = |f: &dyn Fn(&Layer) -> usize| self.layers.iter().map(f).max().unwrap_or(0);
+        let (q_w, kv_w, qkv_w, ff_w) = (widest(&|l| nh * l.head_dim), widest(&|l| l.n_kv * l.head_dim), widest(&|l| l.qkv_proj.out), widest(&|l| l.gate_up.out / 2));
+        let act = if g.bf16_act() { 2 } else { 4 };
+        // t, qkv, q, k, v, a, o, gate|up, gate, ple gate (+ the bf16 copies of hidden and the ple gate).
+        let act_elems = h + qkv_w + q_w + 2 * kv_w + q_w + h + 3 * ff_w + p + if g.bf16_act() { h + p } else { 0 };
+        let per_row = 4 * (h + nl * p + cfg.embedding_dim) + 12 + act * act_elems;
+        let mut tables: Vec<(u64, usize)> = self.layers.iter().map(|l| (l.theta.to_bits(), l.head_dim)).collect();
+        tables.sort_unstable();
+        tables.dedup();
+        let rope = tables.iter().map(|&(_, hd)| 2 * 4 * hd * max_len.next_multiple_of(256)).sum::<usize>();
+        rows * per_row + rope + crate::gpu::ATTN_SCORE_BYTES
+    }
+
+    /// Longest input whose RoPE tables stay cached on the device (6 KB per position for the two head widths,
+    /// so 100 MB here). Longer inputs get tables of their own, freed after the pass.
+    const ROPE_CACHE_POSITIONS: usize = 16384;
+
     /// Whether some layer's packed attention can run on the tensor-core flash kernel (bf16 mode).
     fn has_flash_layers(&self) -> bool {
         let nh = self.cfg.num_attention_heads;
@@ -429,8 +452,21 @@ impl GpuText {
         let max_fused = if lens.len() == 1 { FUSED_MAX_LEN_SINGLE } else { FUSED_MAX_LEN };
         let fused = lens.iter().all(|&l| l <= max_fused) && self.layers.iter().all(|l| g.packed_attention_supported(nh, l.n_kv, l.head_dim));
 
-        let mut rope = self.rope.lock().unwrap_or_else(|e| e.into_inner());
-        let replaced = self.ensure_rope(&mut rope, lens.iter().copied().max().unwrap_or(0))?;
+        let max_len = lens.iter().copied().max().unwrap_or(0);
+        if rows > Self::ROPE_CACHE_POSITIONS / 2 {
+            g.ensure_fits(self.pass_bytes(rows, max_len), || format!("a {max_len}-token input"))?;
+        }
+        // Inputs longer than ROPE_CACHE_POSITIONS get tables of their own; they are never fused, so no
+        // recorded graph refers to them.
+        let (mut own_rope, mut cached_rope, mut replaced) = (HashMap::new(), None, false);
+        if max_len > Self::ROPE_CACHE_POSITIONS {
+            self.ensure_rope(&mut own_rope, max_len)?;
+        } else {
+            let mut cache = self.rope.lock().unwrap_or_else(|e| e.into_inner());
+            replaced = self.ensure_rope(&mut cache, max_len)?;
+            cached_rope = Some(cache);
+        }
+        let rope = cached_rope.as_deref().unwrap_or(&own_rope);
         let mut graphs = self.graphs.lock().unwrap_or_else(|e| e.into_inner());
         if replaced {
             graphs.clear(); // they hold the replaced tables' addresses
@@ -457,7 +493,7 @@ impl GpuText {
                     if let Some(f) = &mut work.flash {
                         g.upload_i32_into(&tiles, &mut f.tiles)?;
                     }
-                    let graph = g.capture(|| self.enqueue(&mut work, &padded, true, &rope))?;
+                    let graph = g.capture(|| self.enqueue(&mut work, &padded, true, rope))?;
                     Ok(TextGraph { work, graph })
                 })();
                 match built {
@@ -488,7 +524,7 @@ impl GpuText {
         if let Some(f) = &mut w.flash {
             g.upload_i32_into(&tiles, &mut f.tiles)?;
         }
-        self.enqueue(&mut w, lens, fused, &rope)?;
+        self.enqueue(&mut w, lens, fused, rope)?;
         g.download(w.out.f32()?)
     }
 }

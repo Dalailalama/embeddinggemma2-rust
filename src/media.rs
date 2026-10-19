@@ -62,25 +62,41 @@ pub fn load_image(path: &Path) -> Result<RgbImage> {
     Ok(image::open(path).with_context(|| format!("decoding image {}", path.display()))?.to_rgb8())
 }
 
+/// Decode an encoded image (png/jpg/webp/gif/bmp/tiff, detected from the bytes) to RGB.
+pub fn decode_image(bytes: &[u8]) -> Result<RgbImage> {
+    Ok(image::load_from_memory(bytes).context("decoding image bytes")?.to_rgb8())
+}
+
 pub fn load_audio(path: &Path) -> Result<AudioClip> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     ensure!(
         ext == "wav" || ext == "wave",
         "only .wav audio is supported natively (got `.{ext}`); convert with ffmpeg: ffmpeg -i in.{ext} -ar 16000 -ac 1 out.wav"
     );
-    let mut reader = hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    read_wav(reader, &path.display().to_string())
+}
+
+/// Decode the bytes of a WAV file (PCM / float), mixed down to mono.
+pub fn decode_audio(bytes: &[u8]) -> Result<AudioClip> {
+    let reader = hound::WavReader::new(std::io::Cursor::new(bytes))
+        .context("decoding audio bytes (only WAV is supported; convert with: ffmpeg -i in -ar 16000 -ac 1 out.wav)")?;
+    read_wav(reader, "audio bytes")
+}
+
+fn read_wav<R: std::io::Read>(mut reader: hound::WavReader<R>, what: &str) -> Result<AudioClip> {
     let spec = reader.spec();
-    ensure!(spec.sample_rate > 0, "{}: the WAV header declares a sample rate of 0 Hz", path.display());
-    ensure!(spec.channels > 0, "{}: the WAV header declares 0 channels", path.display());
+    ensure!(spec.sample_rate > 0, "{what}: the WAV header declares a sample rate of 0 Hz");
+    ensure!(spec.channels > 0, "{what}: the WAV header declares 0 channels");
     let channels = spec.channels as usize;
-    let read = || format!("reading samples from {}", path.display());
+    let read = || format!("reading samples from {what}");
     let interleaved: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
         (hound::SampleFormat::Float, 32) => reader.samples::<f32>().collect::<Result<_, _>>().with_context(read)?,
         (hound::SampleFormat::Int, bits @ (8 | 16 | 24 | 32)) => {
             let scale = 1.0 / (1u64 << (bits - 1)) as f32;
             reader.samples::<i32>().map(|s| s.map(|v| v as f32 * scale)).collect::<Result<_, _>>().with_context(read)?
         }
-        (fmt, bits) => bail!("{}: unsupported WAV format {fmt:?} / {bits} bits", path.display()),
+        (fmt, bits) => bail!("{what}: unsupported WAV format {fmt:?} / {bits} bits"),
     };
     let samples = if channels == 1 {
         interleaved

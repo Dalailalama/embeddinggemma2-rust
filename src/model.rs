@@ -28,12 +28,14 @@ const BOA: &str = "<|audio>";
 const EOA: &str = "<audio|>";
 
 /// A decoded video: RGB frames plus the native frame rate when known.
+#[derive(Clone)]
 pub struct VideoClip {
     pub frames: Vec<RgbImage>,
     pub fps: Option<f64>,
 }
 
 /// One piece of an (optionally interleaved) multimodal input.
+#[derive(Clone)]
 pub enum Part {
     Text(String),
     Image(RgbImage),
@@ -42,6 +44,7 @@ pub enum Part {
 }
 
 /// A single item to embed. Parts are concatenated in order into one prompt.
+#[derive(Clone)]
 pub struct Input {
     pub parts: Vec<Part>,
 }
@@ -90,8 +93,12 @@ pub struct EmbeddingGemma2 {
     gpu: Option<Arc<crate::gpu::Gpu>>,
     /// Device the towers run on.
     pub device: Device,
-    /// Hard cap on text-only sequence length (tokens, including `<bos>`/`<eos>`).
-    pub max_text_tokens: usize,
+    /// Optional cap on text-only sequence length (tokens, including `<bos>`/`<eos>`); longer texts keep
+    /// their first `n - 1` tokens plus `<eos>`. `None` (the default) embeds every token, as
+    /// sentence-transformers does for this model (its `max_seq_length` is unbounded). The model was
+    /// trained on positions up to `text_config.max_position_embeddings` (262 144), and memory grows with
+    /// the length: about 120 KB per token on the GPU, plus the attention scores of the global layers.
+    pub max_text_tokens: Option<usize>,
     /// Resampler used for images and video frames (the reference uses PyTorch's).
     pub resize_mode: ResizeMode,
     /// Audio longer than this many 16 kHz samples is truncated (the reference extractor's default
@@ -109,13 +116,51 @@ enum Kind {
 const KINDS: [(Kind, &str); 3] =
     [(Kind::Image, IMAGE_PLACEHOLDER), (Kind::Video, VIDEO_PLACEHOLDER), (Kind::Audio, AUDIO_PLACEHOLDER)];
 
-/// Everything needed to turn one `Input` into token ids + soft tokens.
-struct Prepared {
+/// An [`Input`] after tokenisation and media preprocessing (resized patches, log-mel features), ready for
+/// the towers and the text backbone.
+///
+/// Making one ([`EmbeddingGemma2::prepare_input`]) runs on the CPU only, so callers can prepare the next
+/// inputs on other threads while the device runs [`EmbeddingGemma2::embed_prepared`].
+pub struct PreparedInput {
     ids: Vec<u32>,
-    image_tokens: Vec<f32>,
-    video_tokens: Vec<f32>,
-    audio_tokens: Vec<f32>,
+    images: Vec<PatchedImage>,
+    videos: Vec<Vec<PatchedImage>>,
+    /// Log-mel features `[frames, n_mels]` and the frame count, per audio clip.
+    mels: Vec<(Vec<f32>, usize)>,
 }
+
+impl PreparedInput {
+    /// Token ids fed to the text backbone (prompt, text, special tokens and soft-token slots).
+    pub fn token_ids(&self) -> &[u32] {
+        &self.ids
+    }
+
+    /// Sequence length the text backbone will process.
+    pub fn num_tokens(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether the vision or audio tower has to run for this input.
+    pub fn has_media(&self) -> bool {
+        !(self.images.is_empty() && self.videos.is_empty() && self.mels.is_empty())
+    }
+}
+
+/// Soft tokens of one input's media, `[n, hidden]` each, in placeholder order.
+struct SoftTokens {
+    image: Vec<f32>,
+    video: Vec<f32>,
+    audio: Vec<f32>,
+}
+
+/// Rows of one shared text-backbone pass when inputs are batched (the weights are then streamed once per
+/// pack, not once per sequence); a longer sequence forms a pack of its own.
+const PACK_TOKENS: usize = 2048;
+/// Most inputs [`EmbeddingGemma2::embed_batch`] prepares at once, and most media among them (an image or audio
+/// clip counts 1, a video half its frames): this bounds the memory held by preprocessed images (about 8 MB
+/// each at the largest size).
+const PREPARE_WINDOW: usize = 256;
+const PREPARE_WINDOW_MEDIA: usize = 16;
 
 impl EmbeddingGemma2 {
     /// Load on the CPU.
@@ -166,7 +211,7 @@ impl EmbeddingGemma2 {
             #[cfg(feature = "cuda")]
             gpu,
             device,
-            max_text_tokens: 8192,
+            max_text_tokens: None,
             resize_mode: ResizeMode::default(),
             max_audio_samples: audioproc::DEFAULT_MAX_SAMPLES,
         })
@@ -235,10 +280,10 @@ impl EmbeddingGemma2 {
     }
 
     fn truncate_text_ids(&self, mut ids: Vec<u32>) -> Vec<u32> {
-        if ids.len() > self.max_text_tokens {
+        if let Some(max) = self.max_text_tokens.filter(|&m| ids.len() > m) {
             // Keep `<bos>` first and `<eos>` last, like HF truncation with special tokens.
             let eos = *ids.last().unwrap();
-            ids.truncate(self.max_text_tokens - 1);
+            ids.truncate(max.max(2) - 1);
             ids.push(eos);
         }
         ids
@@ -248,7 +293,9 @@ impl EmbeddingGemma2 {
     // Input preparation
     // -----------------------------------------------------------------------------------------
 
-    fn prepare(&self, input: &Input) -> Result<Prepared> {
+    /// Tokenise an input and preprocess its media, without running any tower (CPU only; see
+    /// [`PreparedInput`]).
+    pub fn prepare_input(&self, input: &Input) -> Result<PreparedInput> {
         // 1. Assemble the template. Media become placeholders in part order, unless the text
         //    already carries manual placeholders (the chat template's `has_manual_placeholders`).
         let manual = input.parts.iter().any(|p| match p {
@@ -367,46 +414,53 @@ impl EmbeddingGemma2 {
             rest = &rest[pos + ph.len()..];
         }
 
-        // 4. Tokenise (text-only inputs are truncated to the context cap; media inputs are not).
+        // 4. Tokenise (text-only inputs are truncated to `max_text_tokens` if set; media inputs are not).
         let mut ids = self.tokenize(&expanded)?;
         if images.is_empty() && videos.is_empty() && audios.is_empty() {
             ids = self.truncate_text_ids(ids);
         }
 
-        // 5. Run the towers.
-        let mut image_tokens = Vec::new();
-        let mut video_tokens = Vec::new();
-        let mut audio_tokens = Vec::new();
-        if !patched_images.is_empty() || !patched_videos.is_empty() {
+        Ok(PreparedInput { ids, images: patched_images, videos: patched_videos, mels })
+    }
+
+    /// Run the vision / audio towers over a prepared input's media.
+    fn soft_tokens(&self, p: &PreparedInput) -> Result<SoftTokens> {
+        let mut st = SoftTokens { image: Vec::new(), video: Vec::new(), audio: Vec::new() };
+        if !p.images.is_empty() || !p.videos.is_empty() {
             let tower = self.vision()?;
-            for p in &patched_images {
-                image_tokens.extend(tower.encode(p)?);
+            for im in &p.images {
+                st.image.extend(tower.encode(im)?);
             }
-            for frames in &patched_videos {
+            for frames in &p.videos {
                 for f in frames {
-                    video_tokens.extend(tower.encode(f)?);
+                    st.video.extend(tower.encode(f)?);
                 }
             }
         }
-        if !mels.is_empty() {
+        if !p.mels.is_empty() {
             let tower = self.audio()?;
-            for (mel, frames) in &mels {
-                audio_tokens.extend(tower.encode(mel, *frames, n_mels)?);
+            let n_mels = self.proc_cfg.feature_extractor.feature_size;
+            for (mel, frames) in &p.mels {
+                st.audio.extend(tower.encode(mel, *frames, n_mels)?);
             }
         }
-        Ok(Prepared { ids, image_tokens, video_tokens, audio_tokens })
+        Ok(st)
     }
 
-    /// Merge hard-token embeddings with soft tokens at their placeholder positions.
-    fn build_embeds(&self, p: &Prepared) -> Result<Vec<f32>> {
+    /// Write the input embeddings `[ids.len(), hidden]` of a prepared input into `embeds`: hard-token
+    /// embeddings, with the towers' soft tokens at their placeholder positions.
+    fn fill_embeds(&self, p: &PreparedInput, embeds: &mut [f32]) -> Result<()> {
         let h = self.cfg.text_config.hidden_size;
-        let mut embeds = vec![0f32; p.ids.len() * h];
-        self.text.embed_tokens(&p.ids, &mut embeds)?;
+        self.text.embed_tokens(&p.ids, embeds)?;
+        if !p.has_media() {
+            return Ok(());
+        }
+        let soft = self.soft_tokens(p)?;
         let mut used = [0usize; 3];
         let streams: [(&[f32], u32); 3] = [
-            (&p.image_tokens, self.cfg.image_token_id),
-            (&p.video_tokens, self.cfg.video_token_id),
-            (&p.audio_tokens, self.cfg.audio_token_id),
+            (&soft.image, self.cfg.image_token_id),
+            (&soft.video, self.cfg.video_token_id),
+            (&soft.audio, self.cfg.audio_token_id),
         ];
         for (t, &id) in p.ids.iter().enumerate() {
             for (s, (buf, tok)) in streams.iter().enumerate() {
@@ -421,7 +475,7 @@ impl EmbeddingGemma2 {
         for (s, (buf, _)) in streams.iter().enumerate() {
             ensure!(used[s] * h == buf.len(), "soft tokens ({}) != placeholders ({})", buf.len() / h, used[s]);
         }
-        Ok(embeds)
+        Ok(())
     }
 
     // -----------------------------------------------------------------------------------------
@@ -430,63 +484,47 @@ impl EmbeddingGemma2 {
 
     /// Embed one input; returns the L2-normalised 768-d vector.
     pub fn embed(&self, input: &Input) -> Result<Vec<f32>> {
-        let prepared = self.prepare(input)?;
-        let embeds = self.build_embeds(&prepared)?;
-        self.pool(&embeds, prepared.ids.len())
+        Ok(self.embed_with_ids(input)?.1)
     }
 
     /// Like [`embed`](Self::embed) but also returns the token ids that were fed to the encoder.
     pub fn embed_with_ids(&self, input: &Input) -> Result<(Vec<u32>, Vec<f32>)> {
-        let prepared = self.prepare(input)?;
-        let embeds = self.build_embeds(&prepared)?;
-        let emb = self.pool(&embeds, prepared.ids.len())?;
-        Ok((prepared.ids, emb))
+        let p = self.prepare_input(input)?;
+        let emb = self.embed_prepared(std::slice::from_ref(&p))?.pop().unwrap();
+        Ok((p.ids, emb))
     }
 
     /// Embed pre-tokenised text.
     pub fn embed_ids(&self, ids: &[u32]) -> Result<Vec<f32>> {
-        ensure!(!ids.is_empty(), "empty token sequence");
-        let prepared = Prepared {
-            ids: ids.to_vec(),
-            image_tokens: vec![],
-            video_tokens: vec![],
-            audio_tokens: vec![],
-        };
-        let embeds = self.build_embeds(&prepared)?;
-        self.pool(&embeds, ids.len())
+        let p = PreparedInput { ids: ids.to_vec(), images: vec![], videos: vec![], mels: vec![] };
+        Ok(self.embed_prepared(std::slice::from_ref(&p))?.pop().unwrap())
     }
 
-    fn pool(&self, embeds: &[f32], seq: usize) -> Result<Vec<f32>> {
-        let hidden = self.text.forward_packed(embeds, &[seq])?;
-        let dim = self.cfg.text_config.embedding_dim;
-        let mut pooled = ops::mean_rows(&hidden, seq, dim);
-        ops::l2_normalize(&mut pooled);
-        Ok(pooled)
-    }
-
-    /// Embed several token sequences, packing them into shared forward passes of up to
-    /// `PACK_TOKENS` rows (the weights are then streamed once per pack, not once per sequence).
-    fn embed_id_batch(&self, seqs: &[Vec<u32>]) -> Result<Vec<Vec<f32>>> {
-        const PACK_TOKENS: usize = 2048;
+    /// Embed prepared inputs (see [`prepare_input`](Self::prepare_input)); returns one L2-normalised 768-d
+    /// vector per input.
+    ///
+    /// The towers run input by input; the text backbone then processes consecutive inputs packed into
+    /// shared passes of up to `PACK_TOKENS` rows, media inputs included.
+    pub fn embed_prepared(&self, items: &[PreparedInput]) -> Result<Vec<Vec<f32>>> {
         let h = self.cfg.text_config.hidden_size;
         let dim = self.cfg.text_config.embedding_dim;
-        let mut out = Vec::with_capacity(seqs.len());
+        let mut out = Vec::with_capacity(items.len());
         let mut start = 0;
-        while start < seqs.len() {
-            // Greedy pack in input order; an over-long sequence simply forms its own pack.
+        while start < items.len() {
+            // Greedy pack in input order.
             let mut end = start + 1;
-            let mut rows = seqs[start].len();
-            while end < seqs.len() && rows + seqs[end].len() <= PACK_TOKENS {
-                rows += seqs[end].len();
+            let mut rows = items[start].ids.len();
+            while end < items.len() && rows + items[end].ids.len() <= PACK_TOKENS {
+                rows += items[end].ids.len();
                 end += 1;
             }
-            let lens: Vec<usize> = seqs[start..end].iter().map(Vec::len).collect();
+            let lens: Vec<usize> = items[start..end].iter().map(|p| p.ids.len()).collect();
             ensure!(lens.iter().all(|&l| l > 0), "empty token sequence");
             let mut embeds = vec![0f32; rows * h];
             let mut off = 0;
-            for s in &seqs[start..end] {
-                self.text.embed_tokens(s, &mut embeds[off * h..(off + s.len()) * h])?;
-                off += s.len();
+            for p in &items[start..end] {
+                self.fill_embeds(p, &mut embeds[off * h..(off + p.ids.len()) * h])?;
+                off += p.ids.len();
             }
             let hidden = self.text.forward_packed(&embeds, &lens)?;
             let mut off = 0;
@@ -503,27 +541,46 @@ impl EmbeddingGemma2 {
 
     /// Embed a batch and optionally apply Matryoshka truncation (+ re-normalisation).
     ///
-    /// Text-only inputs are packed into shared forward passes; multimodal inputs run one by one.
+    /// Inputs are prepared in parallel on the CPU, a window at a time, then embedded with
+    /// [`embed_prepared`](Self::embed_prepared): every input, media included, shares packed text-backbone
+    /// passes with its neighbours.
     pub fn embed_batch(&self, inputs: &[Input], truncate_dim: Option<usize>) -> Result<Vec<Vec<f32>>> {
-        let mut out: Vec<Option<Vec<f32>>> = (0..inputs.len()).map(|_| None).collect();
-        let (mut text_idx, mut text_ids) = (Vec::new(), Vec::new());
-        for (i, inp) in inputs.iter().enumerate() {
-            let plain = inp.parts.iter().all(|p| match p {
-                Part::Text(t) => !KINDS.iter().any(|(_, ph)| t.contains(ph)),
-                _ => false,
-            });
-            if plain {
-                let text: String = inp.parts.iter().map(|p| if let Part::Text(t) = p { t.as_str() } else { "" }).collect();
-                text_idx.push(i);
-                text_ids.push(self.truncate_text_ids(self.tokenize(&text)?));
-            } else {
-                out[i] = Some(self.embed(inp)?);
+        use rayon::prelude::*;
+        let max_frames = self.proc_cfg.video_processor.max_frames;
+        let media_weight = |i: &Input| -> usize {
+            i.parts
+                .iter()
+                .map(|p| match p {
+                    Part::Text(_) => 0,
+                    Part::Image(_) | Part::Audio(_) => 1,
+                    Part::Video(v) => v.frames.len().min(max_frames).div_ceil(2),
+                })
+                .sum()
+        };
+        let mut out = Vec::with_capacity(inputs.len());
+        let mut start = 0;
+        while start < inputs.len() {
+            let (mut end, mut media) = (start, 0);
+            while end < inputs.len() && end - start < PREPARE_WINDOW {
+                let m = media_weight(&inputs[end]);
+                if end > start && media + m > PREPARE_WINDOW_MEDIA {
+                    break;
+                }
+                media += m;
+                end += 1;
             }
+            let window = &inputs[start..end];
+            let prepared: Vec<PreparedInput> = if window.len() == 1 {
+                vec![self.prepare_input(&window[0])?]
+            } else {
+                window.par_iter().map(|i| self.prepare_input(i)).collect::<Result<_>>()?
+            };
+            for e in self.embed_prepared(&prepared)? {
+                out.push(truncate_and_normalize(e, truncate_dim)?);
+            }
+            start = end;
         }
-        for (i, e) in text_idx.into_iter().zip(self.embed_id_batch(&text_ids)?) {
-            out[i] = Some(e);
-        }
-        out.into_iter().map(|e| truncate_and_normalize(e.unwrap(), truncate_dim)).collect()
+        Ok(out)
     }
 
     /// Embed many text strings (prompt prefixes must already be applied), packed into shared passes.

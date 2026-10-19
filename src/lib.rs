@@ -13,6 +13,7 @@ pub mod imageproc;
 pub mod media;
 pub mod model;
 pub mod ops;
+pub mod serve;
 pub mod text;
 pub mod verify;
 pub mod videoproc;
@@ -21,4 +22,4 @@ pub mod weights;
 
 pub use backend::{Device, Precision};
 pub use media::AudioClip;
-pub use model::{EmbeddingGemma2, Input, Part, VideoClip};
+pub use model::{EmbeddingGemma2, Input, Part, PreparedInput, VideoClip};
