@@ -1,6 +1,6 @@
 [package]
 name = "embeddinggemma2"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Open-source Rust port of Google's EmbeddingGemma 2: text, image, audio and video embeddings on CPU or CUDA"
 license = "Apache-2.0"
