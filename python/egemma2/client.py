@@ -1,10 +1,12 @@
 """Python client for `egemma2 serve`: the model stays loaded in one subprocess for all your requests.
 
-Standard library only; numpy and Pillow are used when you pass their objects (or call `embed_numpy`).
+Standard library only; numpy and Pillow are used when you pass their objects (or call `embed_numpy`), and
+huggingface_hub, if installed, to download the model. `pip install egemma2` puts this module and the egemma2
+binary it drives into the environment; the file also works on its own next to any egemma2 binary.
 
-    from egemma2_client import Egemma2
+    from egemma2 import Egemma2
 
-    with Egemma2(exe="egemma2", model_dir="models/embeddinggemma-2", precision="bf16") as model:
+    with Egemma2(precision="bf16") as model:      # CUDA if available, else the CPU
         docs = model.embed(["first document", "second document"], prompt_name="Document")
         query = model.embed("what is in the documents?", prompt_name="SearchQuery")[0]
         pages = model.embed([Path("page1.png"), Path("page2.png")])    # files, by extension
@@ -27,11 +29,14 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import threading
 from array import array
 from pathlib import Path
 
-__all__ = ["Egemma2", "Egemma2Error"]
+__all__ = ["Egemma2", "Egemma2Error", "find_egemma2_bin", "find_model_dir"]
+
+MODEL_REPO = "google/embeddinggemma-2"
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 AUDIO_EXTS = {".wav", ".wave"}
@@ -135,27 +140,65 @@ def _floats(v):
     return v
 
 
+def find_egemma2_bin():
+    """The egemma2 binary: $EGEMMA2_EXE, the one a `pip install egemma2` put next to this Python, or the PATH."""
+    env = os.environ.get("EGEMMA2_EXE")
+    if env:
+        return env
+    name = "egemma2" + (sysconfig.get_config_var("EXE") or (".exe" if os.name == "nt" else ""))
+    dirs = [sysconfig.get_path("scripts")]
+    user_scheme = getattr(sysconfig, "get_preferred_scheme", lambda _: "nt_user" if os.name == "nt" else "posix_user")("user")
+    try:
+        dirs.append(sysconfig.get_path("scripts", scheme=user_scheme))  # pip install --user
+    except KeyError:
+        pass
+    dirs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin"))  # pip install --target
+    for d in dirs:
+        path = os.path.join(d, name)
+        if os.path.isfile(path):
+            return path
+    found = shutil.which("egemma2")
+    if found:
+        return found
+    raise FileNotFoundError("egemma2 not found: `pip install egemma2`, pass exe=..., set EGEMMA2_EXE or put it on PATH")
+
+
+def find_model_dir():
+    """The model directory: $EGEMMA2_MODEL_DIR, ./models/embeddinggemma-2, or a download of google/embeddinggemma-2
+    into the Hugging Face cache (needs huggingface_hub: `pip install "egemma2[hub]"`; about 1.5 GB, once)."""
+    env = os.environ.get("EGEMMA2_MODEL_DIR")
+    if env:
+        return env
+    local = Path("models") / "embeddinggemma-2"
+    if (local / "model.safetensors").is_file():
+        return str(local.resolve())
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        raise FileNotFoundError(
+            "no model found: pass model_dir=..., set EGEMMA2_MODEL_DIR, install huggingface_hub to download it "
+            f'automatically (pip install "egemma2[hub]"), or run: hf download {MODEL_REPO} --local-dir models/embeddinggemma-2'
+        ) from None
+    return snapshot_download(MODEL_REPO, allow_patterns=["*.json", "*.jinja", "model.safetensors"])
+
+
 class Egemma2:
     """One `egemma2 serve` subprocess. Thread-safe: concurrent calls are sent one at a time."""
 
     def __init__(self, exe=None, model_dir=None, device="auto", precision=None, max_tokens=None, args=(), stderr=None, cwd=None):
         """
-        exe: path to the egemma2 binary (default: $EGEMMA2_EXE, then `egemma2` on PATH).
-        model_dir: the model directory (default: the binary's default, models/embeddinggemma-2).
+        exe: path to the egemma2 binary (default: see `find_egemma2_bin`).
+        model_dir: the model directory (default: see `find_model_dir`).
         device: auto, cpu, cuda or cuda:N. precision: None (float32), "tf32" or "bf16" (GPU only).
         max_tokens: cut texts longer than this (default: no cut, like sentence-transformers).
         args: extra options for `egemma2 serve` (e.g. ["--prompt-name", "Document"]).
         stderr: where the server's log goes (default: this process's stderr).
         """
-        exe = exe or os.environ.get("EGEMMA2_EXE") or shutil.which("egemma2")
-        if not exe:
-            raise FileNotFoundError("egemma2 not found: pass exe=..., set EGEMMA2_EXE or put it on PATH")
-        exe = os.fspath(exe)
+        exe = os.fspath(exe) if exe is not None else find_egemma2_bin()
         # A relative path such as target/release/egemma2 is not searched for by Windows' CreateProcess.
         exe = os.path.abspath(exe) if os.path.isfile(exe) else (shutil.which(exe) or exe)
-        cmd = [exe, "--device", device]
-        if model_dir is not None:
-            cmd += ["--model-dir", os.fspath(model_dir)]
+        model_dir = os.path.abspath(os.fspath(model_dir)) if model_dir is not None else find_model_dir()
+        cmd = [exe, "--device", device, "--model-dir", model_dir]
         if precision in ("bf16", "tf32"):
             cmd.append("--" + precision)
         elif precision not in (None, "fp32", "f32", "float32"):

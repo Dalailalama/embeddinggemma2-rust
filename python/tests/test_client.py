@@ -1,9 +1,10 @@
-"""End-to-end test of egemma2_client against the PyTorch reference embeddings in testdata/ (CPU, float32).
+"""End-to-end test of the egemma2 Python client against the PyTorch reference embeddings in testdata/ (CPU, float32).
 
-    python -m unittest clients/python/test_egemma2_client.py
+    python -m unittest discover -s python/tests          # the client in python/, the binary in target/release
+    <venv>/python -m unittest discover -s python/tests   # in a venv with `pip install egemma2`: the installed package
 
-Needs a built binary (EGEMMA2_EXE, or target/release/egemma2) and the model in models/embeddinggemma-2.
-Pillow and numpy are optional; the cases that need them are skipped without.
+Needs the model in models/embeddinggemma-2 and a binary: EGEMMA2_EXE, the one installed with the package, or
+target/release/egemma2. Pillow and numpy are optional; the cases that need them are skipped without.
 """
 
 import json
@@ -14,13 +15,26 @@ import unittest
 import wave
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from egemma2_client import Egemma2, Egemma2Error  # noqa: E402
-
 ROOT = Path(__file__).resolve().parents[2]
+try:
+    import egemma2  # an installed package wins
+except ImportError:
+    sys.path.insert(0, str(ROOT / "python"))
+    import egemma2
+from egemma2 import Egemma2, Egemma2Error, find_model_dir  # noqa: E402
+
 DATA = ROOT / "testdata"
 MODEL = ROOT / "models" / "embeddinggemma-2"
-EXE = os.environ.get("EGEMMA2_EXE") or str(ROOT / "target" / "release" / ("egemma2.exe" if os.name == "nt" else "egemma2"))
+
+
+def find_exe():
+    try:
+        return egemma2.find_egemma2_bin()
+    except FileNotFoundError:
+        return str(ROOT / "target" / "release" / ("egemma2.exe" if os.name == "nt" else "egemma2"))
+
+
+EXE = find_exe()
 TOL = 1e-5  # float32 CPU vs the PyTorch float32 CPU reference
 
 
@@ -32,6 +46,15 @@ def load(p):
 def max_diff(a, b):
     assert len(a) == len(b), (len(a), len(b))
     return max(abs(x - y) for x, y in zip(a, b))
+
+
+class LookupTest(unittest.TestCase):
+    def test_model_dir_from_environment(self):
+        os.environ["EGEMMA2_MODEL_DIR"] = "/some/model"
+        try:
+            self.assertEqual(find_model_dir(), "/some/model")
+        finally:
+            del os.environ["EGEMMA2_MODEL_DIR"]
 
 
 @unittest.skipUnless(Path(EXE).exists() and (MODEL / "model.safetensors").exists(), "needs the egemma2 binary and the model")

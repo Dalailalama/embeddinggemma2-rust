@@ -1,11 +1,13 @@
 [package]
 name = "embeddinggemma2"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Unofficial Rust port of Google's EmbeddingGemma 2: text, image, audio and video embeddings on CPU or CUDA"
 license = "Apache-2.0"
 repository = "https://github.com/Dalailalama/embeddinggemma2-rust"
 readme = "README.md"
+# Reference data (92 MB), the Hugging Face card and promotion drafts stay out of the crate and the Python sdist.
+exclude = ["testdata/", "hf/", "linkedin/", "promo/", ".github/"]
 keywords = ["embeddings", "gemma", "cuda", "multimodal", "semantic-search"]
 categories = ["science", "multimedia"]
 

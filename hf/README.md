@@ -32,8 +32,9 @@ Not affiliated with or endorsed by Google.
 ## Quick start
 
 ```bash
-# 1. the runtime: a binary from this repo's `releases/` folder or GitHub Releases, or build it
-cargo install --git https://github.com/Dalailalama/embeddinggemma2-rust
+# 1. the runtime: `pip install egemma2` (binary + Python client), a binary from this repo's `releases/`
+#    folder or GitHub Releases, or build it
+pip install egemma2
 # 2. the weights
 hf download google/embeddinggemma-2 --local-dir models/embeddinggemma-2
 # 3. embed (the model directory defaults to models/embeddinggemma-2)
@@ -56,8 +57,8 @@ Requests use the OpenAI embeddings format plus multimodal inputs and prompts, fo
 `{"input": ["a query", {"image": "page1.png"}, {"text": "Figure 3:", "image": "fig3.png"}], "prompt_name": "SearchQuery"}`.
 Images can be paths, data URLs or raw RGB pixels; concurrent requests are merged into shared GPU
 passes. OpenAI-style clients (the `openai` SDK, LangChain, LlamaIndex) work against the HTTP server,
-and a dependency-free Python client for the stdio server is in
-[`clients/python`](https://github.com/Dalailalama/embeddinggemma2-rust/tree/main/clients/python).
+and `pip install egemma2` brings a dependency-free Python client for the stdio server
+(`from egemma2 import Egemma2`).
 Through it a short query takes 2.6 ms round trip. Details:
 [Server mode](https://github.com/Dalailalama/embeddinggemma2-rust#server-mode-keep-the-model-loaded).
 

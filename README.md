@@ -154,9 +154,25 @@ python tools/bench_gpu_compare.py models/embeddinggemma-2 testdata <cuda-python>
 python tools/bench_proc.py models/embeddinggemma-2 <python> target/release/egemma2.exe cuda   # cold start
 ```
 
-## Build
+## Install
 
-Requires a Rust toolchain (1.85+, edition 2024).
+**With pip** (Windows and Linux x64, any Python 3.8+): the `egemma2` binary plus a Python client.
+
+```bash
+pip install "egemma2[hub]"     # [hub] adds huggingface_hub, to download the model on first use
+```
+
+```python
+from egemma2 import Egemma2
+with Egemma2(precision="bf16") as model:
+    vectors = model.embed(["first document", "second document"], prompt_name="Document")
+```
+
+The binary is then on `PATH` as `egemma2` (or `python -m egemma2`); see [Server mode](#server-mode-keep-the-model-loaded)
+for the client. Prebuilt binaries without Python are on the
+[Releases](https://github.com/Dalailalama/embeddinggemma2-rust/releases) page.
+
+**From source**, with a Rust toolchain (1.85+, edition 2024):
 
 ```bash
 git clone https://github.com/Dalailalama/embeddinggemma2-rust.git
@@ -168,9 +184,8 @@ The CUDA backend is the cargo feature `cuda`, on by default. It needs nothing at
 CUDA SDK, no `nvcc`): the NVIDIA driver, cuBLAS and NVRTC are loaded dynamically at run time. For a
 build without CUDA support, use `cargo build --release --no-default-features`.
 
-Or skip the build: the [Releases](https://github.com/Dalailalama/embeddinggemma2-rust/releases)
-page has prebuilt `egemma2` binaries for Windows and Linux (x64; CUDA support included, used when a
-driver is present).
+The prebuilt binaries and wheels include CUDA support, used when a driver is present. The Python
+package builds from source too (`pip install .` in a checkout; needs Rust), for other platforms.
 
 The model files (about 1.5 GB, Apache-2.0, not gated) go in `models/embeddinggemma-2/`. With the
 Hugging Face CLI (`hf`):
@@ -283,20 +298,25 @@ on with the next line. Requests that arrive together are batched: one worker own
 merges queued requests into shared passes, while each request's inputs are decoded and preprocessed
 on its own thread, overlapping earlier requests' device work.
 
-**From Python** without any dependency, [`clients/python/egemma2_client.py`](clients/python/egemma2_client.py)
-starts and talks to the stdio server (copy the file into your project):
+**From Python**, `pip install egemma2` installs the binary and a client that starts the stdio server
+and talks to it ([`python/egemma2/client.py`](python/egemma2/client.py), standard library only; the
+single file also works next to any egemma2 binary):
 
 ```python
 from pathlib import Path
-from egemma2_client import Egemma2
+from egemma2 import Egemma2
 
-with Egemma2(exe="egemma2", model_dir="models/embeddinggemma-2", device="cuda", precision="bf16") as model:
+with Egemma2(device="cuda", precision="bf16") as model:
     docs = model.embed(["first document", "second document"], prompt_name="Document")
     query = model.embed("what do the documents say?", prompt_name="SearchQuery")[0]
     pages = model.embed([Path("page1.png"), Path("page2.png")])           # files, chosen by extension
     mixed = model.embed([{"text": "a photo of", "image": pil_image}])       # Pillow / numpy images too
     matrix = model.embed_numpy(texts, dimensions=256)                       # (n, 256) float32
 ```
+
+Without `model_dir=...`, the client uses `$EGEMMA2_MODEL_DIR`, then `./models/embeddinggemma-2`, then
+downloads `google/embeddinggemma-2` into the Hugging Face cache (with `pip install "egemma2[hub]"`).
+The binary is found through `$EGEMMA2_EXE`, then the one installed with the package, then `PATH`.
 
 **From OpenAI-style clients**, point them at the HTTP server; prompts go in the extra body:
 
@@ -469,7 +489,7 @@ embeddinggemma2::serve::run_stdio(&gpu_model, &embeddinggemma2::serve::ServeOpti
 |---|---|
 | `src/model.rs` | public API, prompt assembly, placeholder expansion, soft-token merge, pooling, batching |
 | `src/serve.rs` | `egemma2 serve`: request format, the device worker that merges queued requests, stdio and HTTP transports |
-| `clients/python/` | `egemma2_client.py` (dependency-free Python client for the stdio server) and its test |
+| `python/`, `pyproject.toml` | the `egemma2` Python package (maturin "bin" project: the binary plus `egemma2/client.py`, a dependency-free client for the stdio server), its PyPI page and its test |
 | `src/backend.rs` | `Device` and the CPU / CUDA dispatch for the three towers |
 | `src/text.rs` | text backbone |
 | `src/vision.rs`, `src/imageproc.rs` | vision tower; resize (PyTorch and Pillow variants) and patchify |
@@ -500,7 +520,7 @@ truncated resampling and the server's request parsing. The Python client has its
 the PyTorch reference data:
 
 ```bash
-python -m unittest clients/python/test_egemma2_client.py     # needs target/release/egemma2 (or EGEMMA2_EXE)
+python -m unittest discover -s python/tests   # binary: EGEMMA2_EXE, a pip-installed one, or target/release
 ```
 
 Environment variables:

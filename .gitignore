@@ -6,3 +6,6 @@
 /testdata/video/v40_96x160.patches.bin
 # Benchmark outputs are machine-specific
 /testdata/bench_*.json
+# Python packaging (maturin) and bytecode
+/dist
+__pycache__/

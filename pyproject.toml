@@ -1,0 +1,46 @@
+# The `egemma2` Python package: the Rust binary (built by maturin as a "bin" project) plus the Python client
+# in python/egemma2. One wheel per platform serves every Python 3 version.
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "egemma2"
+description = "EmbeddingGemma 2 in Rust: text, image, audio and video embeddings on CPU or CUDA, with a Python client and an OpenAI-compatible server"
+readme = "python/README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "DawgOG" }]
+keywords = ["embeddings", "embeddinggemma", "gemma", "multimodal", "semantic-search", "rag", "cuda", "rust"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# Downloads google/embeddinggemma-2 on first use when no model directory is given.
+hub = ["huggingface_hub>=0.23"]
+numpy = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/Dalailalama/embeddinggemma2-rust"
+Documentation = "https://github.com/Dalailalama/embeddinggemma2-rust#server-mode-keep-the-model-loaded"
+"Hugging Face" = "https://huggingface.co/DawgOG/embeddinggemma2-rust"
+Funding = "https://buymeacoffee.com/dawgog"
+
+[tool.maturin]
+bindings = "bin"
+python-source = "python"
+module-name = "egemma2"
+strip = true
