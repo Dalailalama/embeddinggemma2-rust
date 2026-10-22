@@ -13,7 +13,7 @@ text, images, audio and video embedded into one 768-d space, with Matryoshka tru
 loaded dynamically). It needs no Python or PyTorch at runtime, and `egemma2 serve` keeps the model
 loaded behind a JSON-lines or OpenAI-compatible HTTP interface for applications in any language.
 
-**Unofficial:** an independent implementation, not affiliated with or endorsed by Google.
+Open source (Apache-2.0) and independent: not affiliated with or endorsed by Google.
 Code: <https://github.com/Dalailalama/embeddinggemma2-rust> · Hugging Face:
 <https://huggingface.co/DawgOG/embeddinggemma2-rust> · Prebuilt binaries (Windows / Linux x64):
 [Releases](https://github.com/Dalailalama/embeddinggemma2-rust/releases). If it is useful to you,

@@ -1,6 +1,6 @@
 # egemma2: EmbeddingGemma 2 in Rust, for Python
 
-An unofficial, from-scratch Rust implementation of Google's
+An open-source, from-scratch Rust implementation of Google's
 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2): text, images, audio and video
 embedded into one 768-d space (Matryoshka cuts to 512 / 256 / 128), on the CPU or an NVIDIA GPU.
 This package installs the `egemma2` binary plus a small Python client that keeps it loaded, so

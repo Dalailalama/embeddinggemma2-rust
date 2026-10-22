@@ -17,7 +17,7 @@ tags:
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-dawgog-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/dawgog)
 [![GitHub](https://img.shields.io/badge/GitHub-embeddinggemma2--rust-181717?logo=github)](https://github.com/Dalailalama/embeddinggemma2-rust)
 
-An unofficial, from-scratch Rust implementation of
+An open-source, from-scratch Rust implementation of
 [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2): text, images, audio and
 video embedded into one 768-d space (Matryoshka cuts to 512 / 256 / 128), on the CPU or on an NVIDIA
 GPU (fp32, TF32 or bf16 with tensor-core flash attention). No Python or PyTorch at runtime; the CUDA
